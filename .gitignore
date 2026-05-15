@@ -1,0 +1,33 @@
+# Simulation artifacts
+work/
+sim/work/
+*.ucdb
+*.wlf
+*.vcd
+transcript
+vsim.wlf
+modelsim.ini
+*.vstf
+*.log
+
+# Log and coverage output
+logs/
+coverage/
+
+# Editor files
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Compiled outputs
+*.o
+simv
+simv.daidir/
+csrc/
+DVEfiles/
+ucli.key
+novas.*
+verdi*
+*.fsdb
+*.vpd
