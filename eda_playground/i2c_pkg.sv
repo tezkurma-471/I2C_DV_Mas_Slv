@@ -1,4 +1,8 @@
 //=============================================================================
+// GENERATED FILE — do not edit. Rebuild with scripts/build_eda_playground.sh
+// Source of truth: rtl/ tb/ uvm/ sva/ in the project tree.
+//=============================================================================
+//=============================================================================
 // File          : i2c_pkg.sv
 // Description   : Common package for I2C RTL and verification components
 // Language      : SystemVerilog (IEEE 1800-2012)
@@ -83,14 +87,17 @@ package i2c_pkg;
     STS_ERR       = 3'b111   // Generic error state
   } i2c_status_e;
 
-  // Interrupt sources (can be OR'd)
+  // Interrupt sources — values are the BIT POSITIONS in REG_IRQ_EN, and they
+  // match the enable concatenation in i2c_master_controller's IRQ logic.
+  // (The old enum listed sources that did not exist in the RTL and did not
+  // line up with the implemented enable bits.)
   typedef enum logic [2:0] {
-    IRQ_TX_EMPTY  = 3'b000,
-    IRQ_RX_FULL   = 3'b001,
-    IRQ_ARB_LOST  = 3'b010,
-    IRQ_TIMEOUT   = 3'b011,
-    IRQ_DONE      = 3'b100,
-    IRQ_BUS_ERROR = 3'b101
+    IRQ_DONE      = 3'd0,
+    IRQ_ACK       = 3'd1,
+    IRQ_NACK      = 3'd2,
+    IRQ_TIMEOUT   = 3'd3,
+    IRQ_BUS_ERROR = 3'd4,
+    IRQ_ARB_LOST  = 3'd5
   } i2c_irq_e;
 
   //-----------------------------------------------------------------------------
@@ -110,7 +117,8 @@ package i2c_pkg;
     REG_DATA   = 3'h3,  // Data TX/RX buffer
     REG_ADDR   = 3'h4,  // Address register (for auto-addressing)
     REG_IRQ_EN = 3'h5,  // Interrupt enable
-    REG_IRQ_ST = 3'h6   // Interrupt status (read to clear)
+    REG_IRQ_ST = 3'h6   // Interrupt status (mirrors STATUS; NOT clear-on-read —
+                        // the register interface has no read strobe)
   } i2c_reg_e;
 
   //-----------------------------------------------------------------------------

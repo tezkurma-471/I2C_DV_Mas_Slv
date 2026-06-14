@@ -1,7 +1,7 @@
 <div align="center">
   <h1>I2C Protocol Verification Environment (UVM)</h1>
-  <h3>The Ultimate Industry-Grade SystemVerilog UVM Verification Suite</h3>
-  <p><strong>A comprehensive, 100% coverage-driven, self-checking verification environment for an I2C Slave Controller, built strictly according to the NXP UM10204 I2C-bus specification.</strong></p>
+  <h3>SystemVerilog UVM Verification Suite — audited, fixed, and re-verified</h3>
+  <p><strong>A coverage-driven, self-checking verification environment for an I2C Slave Controller, built against the NXP UM10204 I2C-bus specification. See <code>docs/AUDIT_FIX_REPORT.md</code> for the full 2026-06 audit and the fixes that came out of it.</strong></p>
 </div>
 
 ---
@@ -15,9 +15,9 @@
 6. [Master Bus Functional Model (BFM) Driver](#6-master-bus-functional-model-bfm-driver)
 7. [Passive Bus Monitor & State Machine](#7-passive-bus-monitor--state-machine)
 8. [Self-Checking Shadow-Model Scoreboard](#8-self-checking-shadow-model-scoreboard)
-9. [Functional Coverage Model (8 Covergroups)](#9-functional-coverage-model-8-covergroups)
+9. [Functional Coverage Model (17 Covergroups)](#9-functional-coverage-model-17-covergroups)
 10. [SystemVerilog Assertions (SVA) Specification](#10-systemverilog-assertions-sva-specification)
-11. [Exhaustive Test Plan (16 Tests)](#11-exhaustive-test-plan-16-tests)
+11. [Test Plan (19 Bus-Level Tests + 3 RAL Tests)](#11-test-plan-19-bus-level-tests--3-ral-tests)
 12. [Sequence Library Reference](#12-sequence-library-reference)
 13. [Verification Engineering Challenges & Bug Fixes (Interview Defense Guide)](#13-verification-engineering-challenges--bug-fixes-interview-defense-guide)
 14. [Simulation & Build Infrastructure](#14-simulation--build-infrastructure)
@@ -31,11 +31,13 @@ This repository contains a full-scale, production-ready **Universal Verification
 
 In modern VLSI Design Verification (DV) roles at top-tier semiconductor companies (NVIDIA, Apple, Qualcomm, Broadcom), engineers are expected to build robust, reusable, and mathematically provable verification environments. This project demonstrates exact mastery of those skills. 
 
-**Key Objectives Achieved:**
-* **100% Functional Coverage:** Achieved via 8 complex covergroups with cross-coverage for burst lengths, read/write transitions, protocol errors, and register boundaries.
-* **Cycle-Accurate Scoreboarding:** A custom shadow-memory model that exactly mimics the DUT's internal auto-incrementing register pointer, allowing for predictive out-of-order write/read verification.
-* **Abstract vs. Physical Decoupling:** The environment heavily utilizes UVM TLM to separate high-level transaction goals (e.g., "Write 8 bytes to address 0x50") from the low-level physical pin wiggling on the open-drain SDA/SCL lines.
-* **Structural SVA Checks:** Formal-ready temporal logic assertions that constantly monitor the physical bus for specification violations (e.g., SDA transitioning while SCL is high outside of START/STOP conditions).
+**Key Objectives:**
+* **Functional Coverage Model:** 17 covergroups (CG1–CG17) including cross coverage for burst lengths, read/write transitions, protocol errors, repeated-START chain depth, and clock-stretch x direction. The coverage report averages ALL covergroups against a 90% threshold. (Coverage closure is measured per regression with `make cov` — no unconditional "100%" claim is made here; run the regression and read the report.)
+* **True Self-Checking Scoreboard:** dual queued streams (driver intent vs monitor observation) matched in order, byte-for-byte data comparison in both directions, and a shadow register bank built from what was actually on the wire.
+* **Abstract vs. Physical Decoupling:** UVM TLM separates high-level transaction goals (e.g., "Write 8 bytes to address 0x50") from the low-level pin wiggling on the open-drain SDA/SCL lines.
+* **Live SVA Checks:** protocol assertions whose failures are routed through `uvm_report_error`, so an assertion failure FAILS the test — they are not log decoration.
+* **License-free RTL evidence:** `make smoke` runs a pure-SV master↔slave integration test under Icarus Verilog — 33 checks (burst write/read, NACK abort, clock stretch mid-byte AND at the address ACK, repeated START).
+* **Verified on a commercial simulator (2026-06-12):** the UVM suite runs green on EDA Playground (Riviera-PRO 2025.04, UVM 1.2) — 8/8 tests with `UVM_ERROR: 0` and `SCOREBOARD PASSED`. The first shakedown run flushed out 4 latent bugs (3 constraint conflicts in never-executed sequences, 1 real RTL bug: the slave releasing its ACK during a clock stretch) — all fixed and documented in `docs/AUDIT_FIX_REPORT.md` §8.
 
 ---
 
@@ -113,7 +115,7 @@ graph TD
         end
         
         SC[i2c_scoreboard \n Shadow Reference Model]
-        COV[i2c_coverage \n 8 Covergroups]
+        COV[i2c_coverage \n 17 Covergroups]
         VS[i2c_virtual_sequencer]
     end
 
@@ -204,16 +206,27 @@ For each item, it executes the following strictly timed steps:
 6. **STOP Generation:** Pulls SDA low, lets SCL go high, then lets SDA go high.
 
 ### 6.2 Clock Stretching Support
-Before every SCL HIGH phase, the driver implements a timeout loop:
+Every SCL release goes through `scl_release_wait()` — the driver releases the
+line and then waits for the WIRE to actually go high, so a stretching slave
+genuinely pauses the master:
 ```systemverilog
-// Wait for SCL to actually go high (handles clock stretching by slave)
-timeout_count = 0;
-while (vif.scl !== 1'b1 && timeout_count < 1000) begin
+virtual task scl_release_wait();
+  int timeout_count = 0;
+  vif.scl_drv <= 1'b1;
   @(posedge vif.clk);
-  timeout_count++;
-end
+  while (vif.scl !== 1'b1) begin
+    @(posedge vif.clk);
+    timeout_count++;
+    if (timeout_count >= MAX_CLK_STRETCH) begin
+      `uvm_error(get_type_name(), "Clock-stretch timeout")
+      return;
+    end
+  end
+endtask
 ```
-If the slave pulls SCL low, the master pauses gracefully.
+A timeout is a `uvm_error`, not a silent continue. The driver also honors the
+spec timing constants per bit (`T_HD_DAT`, `T_SU_DAT`) and the `T_BUF`
+bus-free time after STOP, which is what makes the protocol SVAs meaningful.
 
 ---
 
@@ -236,28 +249,38 @@ A major challenge in verification is parsing back-to-back packets. If the monito
 
 ## 8. Self-Checking Shadow-Model Scoreboard
 
-The `i2c_scoreboard.sv` is responsible for verifying data integrity and protocol compliance. It receives "Expected" packets from the Driver, and "Actual" packets from the Monitor.
+The `i2c_scoreboard.sv` verifies data integrity and protocol compliance. It
+receives "Expected" items from the Driver and "Actual" items from the Monitor,
+queues both streams, and matches them pairwise in order — robust to either
+stream arriving first.
 
-### 8.1 The Shadow Register Model
-The Scoreboard maintains a perfect replica of the DUT's memory:
+### 8.1 Per-Pair Checks
+1. **Framing:** address and direction must match between intent and wire.
+2. **ACK consistency:** the driver-sampled ACK and the monitor-observed ACK
+   must agree, and only address `0x50` may ever be ACKed.
+3. **Data:** byte-for-byte comparison in BOTH directions — for writes, what
+   the driver meant to send vs what the monitor saw on the wire; for reads,
+   what the driver captured vs what the monitor saw the slave drive.
+4. **NACK-abort:** a NACK'd address must be followed by zero data bytes.
+
+### 8.2 The Shadow Register Model
 ```systemverilog
-logic [7:0] shadow_reg_bank [0:7];
-int         shadow_ptr;
+logic [7:0] ref_reg_bank [0:7];
 ```
+The shadow is updated from the **monitor** stream (what was really on the
+wire). The DUT resets its register pointer on every address ACK, so each
+transaction indexes from register 0 with modulo-8 wrap; read data is checked
+against the shadow byte-for-byte.
 
-### 8.2 Evaluation Algorithm
-1. **When a WRITE transaction arrives (Expected Port):**
-   If the address is `0x50` and the slave ACK'd, the scoreboard iterates through the payload payload. For every byte, it updates `shadow_reg_bank[shadow_ptr]` and increments `shadow_ptr = (shadow_ptr + 1) % 8`.
-2. **When a READ transaction arrives (Actual Port):**
-   The scoreboard validates the data returned by the slave. For every byte in the actual payload, it compares it against `shadow_reg_bank[shadow_ptr]`. If it matches, it increments the pointer. If it mismatches, it throws a `UVM_ERROR`.
-3. **Pointer Persistence:**
-   The `shadow_ptr` is strictly maintained *across* transactions, perfectly mimicking the internal state of the RTL.
+### 8.3 End-of-Test
+`check_phase` flags any unmatched leftover in either queue (a lost or extra
+transaction), and `report_phase` cross-checks expected vs actual counts.
 
 ---
 
-## 9. Functional Coverage Model (8 Covergroups)
+## 9. Functional Coverage Model (17 Covergroups)
 
-Coverage closure is the ultimate metric of verification completeness. The `i2c_coverage.sv` component samples every transaction from the monitor and maps it into 8 distinct covergroups. A report phase warning fires if overall coverage drops below 90%.
+Coverage closure is the ultimate metric of verification completeness. The `i2c_coverage.sv` component samples every transaction from the monitor into 17 covergroups (CG1–CG17): direction, burst size, address ranges, protocol flags, address/byte ACK results, clock stretch, repeated-START chain depth, and seven cross covergroups (including stretch x direction and rep-START x direction). The report-phase warning fires if the average across ALL covergroups drops below 90%. The table below summarizes the main groups:
 
 | Covergroup Name | Verification Purpose | Defined Bins & Crosses |
 |-----------------|----------------------|------------------------|
@@ -276,18 +299,24 @@ Coverage closure is the ultimate metric of verification completeness. The `i2c_c
 
 The `i2c_protocol_assertions.sv` file binds strictly formal property checks to the physical bus. These assertions run continuously in the background and will throw immediate simulation fatal errors if the timing spec is violated.
 
-1. **`A1_START_CONDITION`**: Verifies that SDA falls while SCL is High.
-2. **`A2_STOP_CONDITION`**: Verifies that SDA rises while SCL is High, and both remain stable.
-3. **`A3_SDA_STABLE_DURING_SCL_HIGH`**: The absolute golden rule of I2C. During the data phase, while SCL is high, SDA **must not toggle**.
-4. **`A4_ACK_NACK_DRIVEN`**: Ensures that during the 9th clock cycle, the bus does not float to an unknown (`X` or `Z`) state.
-5. **`A5_CLOCK_STRETCH_BOUNDED`**: Uses a local counter to ensure that SCL is not held low for more than `MAX_CLK_STRETCH` cycles, preventing physical bus lockups.
-6. **`A6_NO_X_Z_ON_BUS`**: Ensures that outside of idle conditions, neither SCL nor SDA ever drop to `X` (unknown) or `Z` (high-impedance/floating) levels during an active packet.
+Assertion failures are routed through `uvm_report_error`, so they increment the
+`UVM_ERROR` count and fail the test (with `$error` they were invisible to the
+pass/fail criteria — see `docs/AUDIT_FIX_REPORT.md` §1.1).
+
+1. **A1 — START leads to clocking**: after SDA falls while SCL is high, SCL must fall within a bounded window.
+2. **A3 — SDA stable during SCL high**: the golden rule of I2C; enforced through data AND ack phases, with START/STOP windows excluded. (The old A2 was removed: its existential `##[1:T_BUF]` window made it near-vacuous, fully subsumed by A7.)
+3. **A4 — ACK/NACK driven**: the 9th clock cycle must not float to `X`/`Z`.
+4. **A5 — Clock stretch bounded**: SCL may not be held low longer than `MAX_CLK_STRETCH` cycles.
+5. **A6 — No X/Z on bus**: during an active packet, neither line may go unknown.
+6. **A7 — Full bus-free window**: after STOP, both lines must stay high for the entire `T_BUF` window.
+7. **A8 — SDA hold after SCL fall**: SDA must not move with/just after the SCL falling edge (structural 2-cycle minimum; UM10204 t_HD;DAT min is 0 and the slave legitimately responds a few cycles later through its input synchronizers).
+8. **A9 — SDA setup before SCL rise**: SDA must be stable for `T_SU_DAT` cycles before each sampling edge.
 
 ---
 
-## 11. Exhaustive Test Plan (16 Tests)
+## 11. Test Plan (19 Bus-Level Tests + 3 RAL Tests)
 
-The UVM Test library (`i2c_tests.sv`) contains 16 highly specific tests. Each test instantiates a specific sequence, defines execution length, configures the environment (Active vs Passive slave), and manages UVM objections.
+The UVM Test library (`i2c_tests.sv`) contains 19 bus-level tests (base + 18 derived). Each test instantiates a specific sequence, configures the environment (Active vs Passive slave), and manages UVM objections. Three additional register-level tests run on the separate RAL bench (`make regress_ral`).
 
 | Test Class Name | Target Sequence | Test Description & Objective |
 |-----------------|-----------------|------------------------------|
@@ -305,8 +334,13 @@ The UVM Test library (`i2c_tests.sv`) contains 16 highly specific tests. Each te
 | `addr_sweep_test` | `i2c_addr_sweep_seq` | Iterates addresses 0x08 to 0x77. Objective: Fill `i2c_address_cg`. |
 | `bus_free_test` | `i2c_bus_free_seq` | Manual SCL/SDA check. Objective: Prove lines return to 1'b1 after STOP condition. |
 | `sequential_txn_test` | `i2c_sequential_seq` | 10 back-to-back alternating Reads and Writes. Objective: FSM transition stress testing. |
-| `data_pattern_test` | `i2c_data_pattern_seq` | Injects 0x00, 0xFF, 0xAA, 0x55. Objective: Fill `i2c_data_cg` and test crosstalk logic. |
-| `full_stress_test` | `i2c_stress_seq` | 100 randomly constrained packets. Objective: Final robustness check. |
+| `data_pattern_test` | `i2c_data_pattern_seq` | Injects 0x00, 0xFF, 0xAA, 0x55, walking 1s/0s. Objective: data-pattern coverage. |
+| `full_stress_test` | `i2c_stress_seq` | 100 randomly constrained packets incl. ~25% repeated-START chains. Objective: Final robustness check. |
+| `arbitration_lost_test` | `arb_lost_sequence` + compete-mode slave driver | A competing master pulls SDA low mid-byte (T13). Objective: wired-AND arbitration behavior. Scoreboard runs in corruption-tolerant mode (the corruption is the point). |
+| `deep_rep_start_test` | `deep_rep_start_sequence` | 4-segment repeated-START chain (T14). Objective: close rep-depth coverage bins 0/1/2/3. |
+| `stretch_read_test` | `i2c_stretch_vseq` (virtual sequencer) | Slave stretches SCL during a WRITE and then a READ (T15). Objective: close the stretch x DIR_READ cross. |
+
+**RAL tests** (`make regress_ral`, separate `top_tb_ral` bench): `i2c_ral_reset_test` (reset values + CMD write-only check), `i2c_ral_program_test` (field-level master programming), `i2c_ral_field_test` (read-modify-write without disturbing sibling fields).
 
 ---
 
@@ -324,7 +358,13 @@ The `i2c_sequences.sv` file defines the specific stimulus algorithms.
 
 ## 13. Verification Engineering Challenges & Bug Fixes (Interview Defense Guide)
 
-This environment was rigorously audited and refined to reach 100% stability. Be prepared to discuss these exact engineering problems in technical interviews.
+The bugs below are the original (V1/V2-era) fixes. A second, deeper audit was
+performed on 2026-06-10 — **read `docs/AUDIT_FIX_REPORT.md`** for the complete
+findings-to-fixes log, including: dead write-data checking in the scoreboard,
+SVA failures invisible to pass/fail, the master RTL releasing the bus between
+bytes, a repeated-START that never appeared on the wire, clock stretch that
+never actually triggered, and the broken coverage-merge flow. That document is
+the primary interview-defense material; this section is kept as history.
 
 ### 🔴 Bug 1: Clock Stretch Infinite Loop (RTL Deadlock)
 **The Problem:** The RTL implemented `if (stretch_en)` as a level-sensitive check inside the `SLV_ACK_ADDR` state. Because the UVM Slave Agent drove `stretch_en` high for the duration of the entire test, the RTL state machine got stuck infinitely looping into the `SLV_STRETCH_CLK` state, completely deadlocking the simulation.
@@ -358,10 +398,12 @@ This repository is built for scale and continuous integration.
 
 ### 14.1 Makefile Architecture
 The `Makefile` located in `sim/` provides 1-click execution.
-* `make compile`: Invokes `vlog` with UVM include directories.
-* `make sim TEST=full_stress_test`: Runs a targeted test.
-* `make regress`: A massive bash loop that executes all 16 tests across 3 different randomization seeds (48 total simulations). It parses the output logs and dynamically greps for `SCOREBOARD PASSED` to build a clean terminal summary.
-* `make cov`: Merges all 48 `ucdb` coverage databases into a unified HTML report.
+* `make compile` / `make compile_ral`: Invokes `vlog` for the bus-level and register-level benches.
+* `make sim TEST=full_stress_test` / `make sim_ral RAL_TEST=i2c_ral_reset_test`: Runs a targeted test; every run saves its UCDB into `coverage/`.
+* `make smoke`: License-free RTL integration test (Icarus Verilog) — RTL master vs RTL slave on real open-drain wires.
+* `make regress`: 19 tests x 3 seeds (57 simulations). A run FAILS if its log contains any real `UVM_ERROR` line (assertion failures included) — only then is `SCOREBOARD PASSED` consulted.
+* `make regress_ral`: The 3 register-abstraction-layer tests.
+* `make cov`: Merges every `coverage/*.ucdb` into a unified HTML + text report.
 
 ### 14.2 Multi-Vendor Support
 Because different companies use different toolchains, `scripts/compile.sh` was written to support standard EDA vendors.
@@ -369,8 +411,12 @@ Because different companies use different toolchains, `scripts/compile.sh` was w
 * **VCS (Synopsys):** `./scripts/compile.sh vcs`
 * **Xcelium (Cadence):** `./scripts/compile.sh xcelium`
 
-### 14.3 EDA Playground Bundle
-For rapid portfolio demonstration, the `eda_playground/` directory contains a flattened version of the codebase. By copy-pasting the 5 files in that directory into edaplayground.com, anyone can instantly simulate the entire UVM environment in their web browser without a local license.
+### 14.3 EDA Playground Bundle (verified working 2026-06-12)
+For rapid portfolio demonstration, `scripts/build_eda_playground.sh` generates a **two-file bundle** sized for EDA Playground's 100k-character-per-file limit:
+* `eda_playground/ep_design.sv` → paste into the **design.sv** (right) pane: `i2c_pkg` + RTL + interfaces + SVA (~76k chars).
+* `eda_playground/ep_testbench.sv` → paste into the **testbench.sv** (left) pane: comment-stripped UVM tb package + `top_tb` (~84k chars).
+
+Settings: SystemVerilog/Verilog, **Aldec Riviera-PRO 2025.04**, UVM 1.2 library checked, Top = `top_tb`. Run one test per session via the run options: `vsim +UVM_TESTNAME=<test_name>; run -all; exit`. All 8 demonstrated tests pass green on this configuration. The bundle is **generated** — regenerate it after any source change instead of editing it by hand (the script also emits the older 5-file split for simulators without per-file limits).
 
 ---
 
@@ -406,20 +452,28 @@ i2c-protocol-dv/
 │   ├── i2c_slave_driver.sv     # Drives backdoor force_nack signals based on Slave Sequencer.
 │   ├── i2c_slave_monitor.sv    # Reads internal DUT FSM state and builds status objects.
 │   ├── i2c_slave_agent.sv      # Encapsulates Slave Seq/Drv/Mon. Defaults to UVM_PASSIVE.
-│   ├── i2c_scoreboard.sv       # Shadow Register logic. Compares TLM streams.
-│   ├── i2c_coverage.sv         # 8 distinct covergroups crossing protocols, data, and ptrs.
+│   ├── i2c_scoreboard.sv       # Queued intent-vs-wire matching + shadow register bank.
+│   ├── i2c_coverage.sv         # 17 covergroups crossing protocol, data, stretch, rep-depth.
 │   ├── i2c_base_test.sv        # Base class containing standard timeout logic.
-│   └── i2c_tests.sv            # Library of 15 extended test classes modifying factory configs.
+│   ├── i2c_tests.sv            # Library of 18 extended test classes modifying factory configs.
+│   ├── i2c_cpu_*.sv            # CPU register agent for the RAL bench.
+│   └── i2c_ral_env.sv / i2c_ral_test.sv  # RAL environment + 3 register tests.
 │
 ├── sva/                        
 │   └── i2c_protocol_assertions.sv # 6 `property` blocks running under `assert property`.
 │
+├── ral/                        
+│   ├── i2c_master_reg_model.sv # uvm_reg_block model of the master's CSR map.
+│   ├── i2c_reg_adapter.sv      # reg2bus / bus2reg translation.
+│   └── i2c_ral_seq.sv          # Reset-check (incl. CMD WO), program, field sequences.
+│
 ├── sim/                        
-│   └── Makefile                # Automates compilation, regression, and coverage reporting.
+│   └── Makefile                # Compilation, regression, RAL bench, smoke, coverage.
 │
 ├── scripts/                    
 │   ├── compile.sh              # Bash script wrapper for multi-tool simulation commands.
-│   ├── run_all_tests.sh        # Legacy test runner.
+│   ├── run_all_tests.sh        # Shell regression runner (kept in sync with Makefile TESTS).
+│   ├── build_eda_playground.sh # Regenerates eda_playground/ from canonical sources.
 │   └── coverage_report.sh      # Legacy coverage merger.
 │
 ├── eda_playground/             
@@ -433,7 +487,8 @@ i2c-protocol-dv/
 ├── docs/                       
 │   ├── verification_plan.md    # Initial phase planning document.
 │   ├── BUG_REPORT.md           # Log of initial findings prior to remediation.
-│   ├── FINAL_REPORT.md         # Final assessment of the DV phase.
+│   ├── FINAL_REPORT.md         # Final assessment of the original DV phase.
+│   ├── AUDIT_FIX_REPORT.md     # 2026-06 deep audit: every finding -> fix (read this).
 │   └── archive/                # Deprecated guides and phase 1 notes.
 │
 ├── .gitignore                  # Prevents committing simulation logs, VCDs, and UCDB files.

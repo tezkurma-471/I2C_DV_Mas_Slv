@@ -190,7 +190,6 @@ class clock_stretch_test extends i2c_base_test;
     stretch_seq = i2c_clock_stretch_seq::type_id::create("stretch_seq");
     stretch_seq.addr = 7'h50;
     stretch_seq.data = 8'hCC;
-    stretch_seq.stretch_cycles = 16'd100;
     stretch_seq.start(env.master_agent.sequencer);
     #2000;
     `uvm_info(get_type_name(), "clock_stretch_test finished.", UVM_LOW)
@@ -356,6 +355,10 @@ class arbitration_lost_test extends i2c_base_test;
                               "compete_mode", 1'b1);
     uvm_config_db#(int)::set(this, "env.slave_agent.driver",
                               "compete_at_bit", 3);  // collide at bit 3
+    // The competing master corrupts the wire ON PURPOSE, so driver-intent vs
+    // monitor-observed comparisons must not be flagged as failures here.
+    uvm_config_db#(bit)::set(this, "env.scoreboard",
+                              "allow_bus_corruption", 1'b1);
     super.build_phase(phase);
   endfunction
 
@@ -385,6 +388,37 @@ endclass : arbitration_lost_test
 // After this test: all 4 depth bins [0,1,2,3] are covered.
 // Also closes: CG16 (write+no_stop cell) and CG14 (rep_start+write cell).
 //=============================================================================
+//=============================================================================
+// T15: Stretch-Read Test (virtual sequence)
+// Runs i2c_stretch_vseq on the virtual sequencer: the slave stretches SCL
+// during a WRITE and then during a READ. Closes the has_stretch x DIR_READ
+// cross in CG17 (i2c_stretch_dir_cross_cg), which no other test can hit.
+//=============================================================================
+class stretch_read_test extends i2c_base_test;
+  `uvm_component_utils(stretch_read_test)
+
+  function new(string name = "stretch_read_test", uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    uvm_config_db#(uvm_active_passive_enum)::set(this, "env.slave_agent",
+                                                  "is_active", UVM_ACTIVE);
+    super.build_phase(phase);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    i2c_stretch_vseq vseq;
+    phase.raise_objection(this);
+    `uvm_info(get_type_name(), "Starting stretch_read_test (T15)...", UVM_LOW)
+    vseq = i2c_stretch_vseq::type_id::create("vseq");
+    vseq.start(env.v_sequencer);
+    #2000;
+    `uvm_info(get_type_name(), "stretch_read_test finished.", UVM_LOW)
+    phase.drop_objection(this);
+  endtask
+endclass : stretch_read_test
+
 class deep_rep_start_test extends i2c_base_test;
   `uvm_component_utils(deep_rep_start_test)
 

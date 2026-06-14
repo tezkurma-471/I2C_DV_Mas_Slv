@@ -1,26 +1,50 @@
 # EDA Playground Setup Guide -- I2C UVM Verification
 
-This guide walks you through running the I2C protocol verification testbench on **EDA Playground** (online simulator). The flat files in `eda_playground/` are pre-flattened versions of the directory-structured project; copy each one into its own EDA Playground tab in the order shown.
+This guide walks you through running the I2C protocol verification testbench on **EDA Playground** (online simulator). The flat files in `eda_playground/` are **generated** from the canonical `rtl/ tb/ uvm/ sva/` sources by `scripts/build_eda_playground.sh` — never edit them by hand; rerun the script after any source change so the bundle cannot diverge from the real tree.
 
 ---
 
-## Section 1: EDA Playground Setup (Recommended)
+## Section 1: EDA Playground Setup — VERIFIED WORKING CONFIG (2026-06-12)
+
+> **This exact configuration ran 8/8 tests green on 2026-06-12.** Use it as-is.
 
 Open **https://edaplayground.com** and configure the project settings as follows:
 
 | Setting       | Value                                                              |
 | ------------- | ------------------------------------------------------------------ |
 | Language      | **SystemVerilog/Verilog**                                          |
-| Simulator     | **Questa 2024.1** (recommended) -- fallback: **Riviera-PRO 2023.04** |
-| Top Module    | **top_tb**                                                         |
+| Simulator     | **Aldec Riviera-PRO 2025.04** (verified) — Questa also works if available |
+| Top Module    | **top_tb** (auto-detected)                                         |
 | Libraries     | **UVM 1.2** (checked)                                              |
-| Assertions    | **Run all assertions** (checked)                                    |
 
 Do NOT check UVM 1.1 or OVM -- this project targets UVM 1.2.
 
+**Two hard constraints discovered the hard way:**
+1. **Each editor pane has a 100,000-character limit.** That is why the bundle
+   is two combined files (`ep_design.sv` ~76k, `ep_testbench.sv` ~84k), not
+   the 5 logical files.
+2. **Riviera is stricter than Questa.** It rejects `small`/`medium`/`large`
+   as covergroup bin names (reserved trireg charge-strength keywords) and
+   enforces constraint satisfiability exactly. The sources are already fixed
+   for this — but remember it if you ever regenerate after edits.
+
+### Two-pane layout
+
+| EDA Playground pane | Paste this file | Contents |
+| --- | --- | --- |
+| **design.sv** (RIGHT pane) | `eda_playground/ep_design.sv` | `i2c_pkg` + all RTL + interfaces + SVA (compiled FIRST) |
+| **testbench.sv** (LEFT pane) | `eda_playground/ep_testbench.sv` | UVM tb package (comment-stripped to fit 100k) + `top_tb` |
+
+EDA Playground always compiles `design.sv` before `testbench.sv`, which gives
+exactly the package-visibility order the 5-file layout enforced via tabs.
+
 ---
 
-## Section 2: File Upload Order -- CRITICAL
+## Section 2: File Upload Order — 5-file layout (REFERENCE ONLY — use Section 1's two-pane layout instead)
+
+> The 5-file split below is kept for simulators **without** a per-file size
+> limit (e.g., a local tool reading `eda_playground/` directly). On
+> edaplayground.com, use the two combined files from Section 1.
 
 Files must be added in this exact order. SystemVerilog packages must be visible to all later files, so `i2c_pkg.sv` always comes first.
 
@@ -82,13 +106,14 @@ When all 5 tabs are populated, you are ready to run.
 
 ## Section 4: Run a Specific Test
 
-Locate the **"Compile & Run Options"** textbox at the bottom of EDA Playground. Paste:
+With Riviera-PRO selected, set the **"Run options"** field (the verified
+working invocation) to:
 
 ```
-+UVM_TESTNAME=basic_write_test +UVM_VERBOSITY=UVM_MEDIUM
+vsim +UVM_TESTNAME=basic_write_test; run -all; exit
 ```
 
-To run a different test, replace `basic_write_test` with one of the names below. There are **18** available tests (16 functional + T13 arbitration + T14 deep rep-start):
+To run a different test, replace `basic_write_test` with one of the names below — one test per run (EDA Playground sessions are isolated; there is no cross-run coverage merge). There are **19** available tests:
 
 | #   | Test Name                | Description                                                  |
 | --- | ------------------------ | ------------------------------------------------------------ |
@@ -109,7 +134,8 @@ To run a different test, replace `basic_write_test` with one of the names below.
 | --- | `data_pattern_test`      | Walking-1, walking-0, all corner patterns                    |
 | --- | `full_stress_test`       | 100-transaction stress run                                   |
 | **T13** | **`arbitration_lost_test`** | **Competing master pulls SDA low mid-byte -- expects master to detect arb_lost and abort** |
-| **T14** | **`deep_rep_start_test`** | **NEW: 4-segment repeated-START chain (W→W→W→R); closes CG11 bins two_rep/deep_rep, CG14 rep+write cell, CG16 write+no_stop cell** |
+| **T14** | **`deep_rep_start_test`** | **4-segment repeated-START chain (W→W→W→R); closes CG11 bins two_rep/deep_rep, CG14 rep+write cell, CG16 write+no_stop cell** |
+| **T15** | **`stretch_read_test`** | **Virtual sequence: clock-stretched write THEN clock-stretched read via v_sequencer (slave agent ACTIVE) — the test that exposed the SLV_STRETCH ACK-release RTL bug** |
 
 Then click **Run** (green play button).
 

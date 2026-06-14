@@ -1,7 +1,8 @@
 //=============================================================================
 // File          : i2c_coverage.sv
 // Description   : UVM Functional Coverage Collector for I2C Verification
-//               : V3: 8 covergroups for comprehensive coverage
+//               : V4: 17 covergroups (CG1-CG17) incl. cross coverage;
+//               : report_phase averages ALL covergroups for the threshold.
 // Language      : SystemVerilog (IEEE 1800-2012) + UVM 1.2
 //=============================================================================
 
@@ -189,12 +190,15 @@ class i2c_coverage extends uvm_subscriber #(i2c_seq_item);
     option.per_instance = 1;
     option.name = "Dir x Data Size";
     cp_dir: coverpoint item.dir;
+    // NOTE: bin names must avoid `small`/`medium`/`large` — they are reserved
+    // Verilog keywords (trireg charge strengths). Questa tolerates them as
+    // bin identifiers; Riviera-PRO correctly rejects them.
     cp_size: coverpoint item.num_data {
-      bins single  = {1};
-      bins small   = {[2:4]};
-      bins medium  = {[5:8]};
-      bins large   = {[9:16]};
-      bins xlarge  = {[17:32]};
+      bins single    = {1};
+      bins sz_small  = {[2:4]};
+      bins sz_medium = {[5:8]};
+      bins sz_large  = {[9:16]};
+      bins sz_xlarge = {[17:32]};
     }
     cross cp_dir, cp_size;
   endgroup
@@ -275,16 +279,38 @@ class i2c_coverage extends uvm_subscriber #(i2c_seq_item);
   endfunction
 
   virtual function void report_phase(uvm_phase phase);
-    real dir_cov   = i2c_dir_cg.get_coverage();
-    real size_cov  = i2c_data_size_cg.get_coverage();
-    real ack_cov   = i2c_ack_cg.get_coverage();
-    real burst_cov = i2c_burst_cg.get_coverage();
-    real avg_cov   = (dir_cov + size_cov + ack_cov + burst_cov) / 4.0;
-    
+    // FIX (post-audit): the old threshold averaged only 4 of the 17
+    // covergroups, so a hole in any of the other 13 never triggered the
+    // warning. Average ALL covergroups.
+    real cov_vals[$];
+    real avg_cov = 0.0;
+
+    cov_vals.push_back(i2c_dir_cg.get_coverage());
+    cov_vals.push_back(i2c_data_size_cg.get_coverage());
+    cov_vals.push_back(i2c_addr_cg.get_coverage());
+    cov_vals.push_back(i2c_protocol_cg.get_coverage());
+    cov_vals.push_back(i2c_ack_cg.get_coverage());
+    cov_vals.push_back(i2c_burst_cg.get_coverage());
+    cov_vals.push_back(i2c_reg_ptr_cg.get_coverage());
+    cov_vals.push_back(i2c_target_cg.get_coverage());
+    cov_vals.push_back(i2c_byte_nack_cg.get_coverage());
+    cov_vals.push_back(i2c_stretch_cg.get_coverage());
+    cov_vals.push_back(i2c_rep_depth_cg.get_coverage());
+    cov_vals.push_back(i2c_dir_addr_cross_cg.get_coverage());
+    cov_vals.push_back(i2c_dir_ack_cross_cg.get_coverage());
+    cov_vals.push_back(i2c_rep_dir_cross_cg.get_coverage());
+    cov_vals.push_back(i2c_dir_size_cross_cg.get_coverage());
+    cov_vals.push_back(i2c_protocol_dir_cross_cg.get_coverage());
+    cov_vals.push_back(i2c_stretch_dir_cross_cg.get_coverage());
+
+    foreach (cov_vals[i]) avg_cov += cov_vals[i];
+    avg_cov = avg_cov / cov_vals.size();
+
     super.report_phase(phase);
-    `uvm_info(get_type_name(), 
-              $sformatf("\n--- COVERAGE SUMMARY ---\nDir: %0.2f%%\nSize: %0.2f%%\nACK: %0.2f%%\nBurst: %0.2f%%\nAVG: %0.2f%%\n------------------------", 
-                        dir_cov, size_cov, ack_cov, burst_cov, avg_cov), UVM_LOW)
+    `uvm_info(get_type_name(),
+              $sformatf("\n--- COVERAGE SUMMARY (all %0d covergroups) ---\nDir: %0.2f%%  Size: %0.2f%%  ACK: %0.2f%%  Burst: %0.2f%%\nAVG (all CGs): %0.2f%%\n------------------------",
+                        cov_vals.size(),
+                        cov_vals[0], cov_vals[1], cov_vals[4], cov_vals[5], avg_cov), UVM_LOW)
     if (avg_cov < 90.0) begin
       `uvm_warning(get_type_name(), $sformatf("Coverage is below 90%%: %0.2f%%", avg_cov))
     end

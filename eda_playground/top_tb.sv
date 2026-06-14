@@ -1,4 +1,8 @@
 //=============================================================================
+// GENERATED FILE — do not edit. Rebuild with scripts/build_eda_playground.sh
+// Source of truth: rtl/ tb/ uvm/ sva/ in the project tree.
+//=============================================================================
+//=============================================================================
 // File          : top_tb.sv
 // Description   : Top-level testbench for I2C Protocol Verification
 //               : V2: Added force_data_nack connection.
@@ -67,9 +71,14 @@ module top_tb;
     run_test();  // FIX: no default — +UVM_TESTNAME controls test selection
   end
 
+  // Waveform dump only on request (+DUMP). Unconditional $dumpvars spams
+  // "no read access" PLI noise on simulators that restrict signal access by
+  // default (e.g. Riviera EDU on EDA Playground) and slows long tests.
   initial begin
-    $dumpfile("waves.vcd");
-    $dumpvars(0, top_tb);
+    if ($test$plusargs("DUMP")) begin
+      $dumpfile("waves.vcd");
+      $dumpvars(0, top_tb);
+    end
   end
 
   initial begin

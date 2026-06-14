@@ -1,4 +1,8 @@
 //=============================================================================
+// GENERATED FILE — do not edit. Rebuild with scripts/build_eda_playground.sh
+// Source of truth: rtl/ tb/ uvm/ sva/ in the project tree.
+//=============================================================================
+//=============================================================================
 // File          : i2c_master_controller.sv
 // Description   : Synthesizable I2C Master Byte-Level Controller (FIXED)
 //               : Generates START, STOP, data bytes, handles ACK/NACK and
@@ -51,25 +55,42 @@ module i2c_master_controller (
   // driving 0 asserts (pulls down), driving 1 releases (pull-up wins with 'z')  
   assign sda = (sda_o == 1'b0) ? 1'b0 : 1'bz;
   assign scl = (scl_o == 1'b0) ? 1'b0 : 1'bz;
-  assign sda_i = sda;
-  assign scl_i = scl;
 
-  // SCL Edge Detection for Sampling  
-  logic scl_d, sda_d;
-  logic scl_rise, scl_fall;
+  // SCL/SDA are asynchronous (other masters / stretching slaves drive them).
+  // Two-flop synchronizers protect the edge detectors and FSM.
+  logic scl_meta, scl_sync;
+  logic sda_meta, sda_sync;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      scl_meta <= 1'b1;
+      scl_sync <= 1'b1;
+      sda_meta <= 1'b1;
+      sda_sync <= 1'b1;
+    end else begin
+      scl_meta <= scl;
+      scl_sync <= scl_meta;
+      sda_meta <= sda;
+      sda_sync <= sda_meta;
+    end
+  end
+
+  assign sda_i = sda_sync;
+  assign scl_i = scl_sync;
+
+  // SCL Edge Detection for Sampling
+  logic scl_d;
+  logic scl_rise;
 
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       scl_d <= 1'b1;
-      sda_d <= 1'b1;
     end else begin
       scl_d <= scl_i;
-      sda_d <= sda_i;
     end
   end
 
   assign scl_rise = ( scl_i && !scl_d);
-  assign scl_fall = (!scl_i &&  scl_d);
 
   //---------------------------------------------------------------------------
   // Internal State Machine
@@ -82,10 +103,12 @@ module i2c_master_controller (
     STATE_RX_BIT,
     STATE_ACK_WAIT,
     STATE_ACK_SEND,
-    STATE_STOP_1,
-    STATE_STOP_2,
-    STATE_REP_START_1,
-    STATE_REP_START_2
+    STATE_BYTE_HOLD,   // SCL held LOW between bytes — keeps bus ownership
+    STATE_STOP_1,      // setup: SCL low, SDA low
+    STATE_STOP_2,      // SCL rises (SDA still low)
+    STATE_STOP_3,      // SDA rises while SCL high = STOP on the wire
+    STATE_REP_START_1, // setup: SCL high, SDA high
+    STATE_REP_START_2  // SDA falls while SCL high = Sr on the wire
   } state_e;
 
   state_e state, next_state;
@@ -109,9 +132,19 @@ module i2c_master_controller (
   logic [2:0] bit_cnt;
 
   // Timer with one-shot clear to avoid infinite loop
-  logic [$clog2(T_SCL_PERIOD)-1:0] timer;
-  logic                           timer_clr;
-  logic                           timer_expired;
+  localparam int TIMER_W = $clog2(T_SCL_PERIOD);
+  localparam logic [TIMER_W-1:0] TIMER_LAST       = TIMER_W'(T_SCL_PERIOD - 1);
+  localparam logic [TIMER_W-1:0] SCL_LOW_TICKS    = TIMER_W'(T_SCL_LOW);
+  localparam logic [TIMER_W-1:0] SCL_HI_END_TICKS = TIMER_W'(T_SCL_LOW + T_SCL_HIGH - 1);
+
+  logic [TIMER_W-1:0] timer;
+  logic               timer_clr;
+  logic               timer_expired;
+
+  // Slave is stretching: we released SCL but the wire is still LOW.
+  // While this is true the bit timer freezes, so every SCL-high window
+  // (including the ACK sample window) starts only once the slave lets go.
+  logic scl_stretched;
 
   // Clock stretch detection
   logic [15:0] stretch_cnt;
@@ -119,8 +152,9 @@ module i2c_master_controller (
   // Registered ACK sample (sampled on SCL rising edge)
   logic ack_received;
 
-  // Transaction direction
-  i2c_dir_e tx_dir;
+  // Arbitration-loss flag (set in the always_ff near the bottom of the file;
+  // declared here because the FSM combinational block reads it)
+  logic arb_lost_reg;
 
   //---------------------------------------------------------------------------
   // Shift Register
@@ -150,7 +184,9 @@ module i2c_master_controller (
         endcase
       end
 
-      // FIX BUG #10: Capture received byte into reg_data_buf when RX completes
+      // FIX BUG #10: Capture received byte into reg_data_buf when RX completes.
+      // Without this, CPU reads 0x00 via REG_DATA after every read transaction
+      // because shift_reg is never forwarded to the CPU-visible register.
       if (state == STATE_RX_BIT && next_state == STATE_ACK_SEND) begin
         reg_data_buf <= shift_reg;
       end
@@ -179,11 +215,12 @@ module i2c_master_controller (
 
   // Map reg_cmd to enumeration
   assign current_cmd = i2c_cmd_e'(reg_cmd[3:0]);
-  assign tx_dir      = i2c_dir_e'(reg_addr[0]);
 
   //---------------------------------------------------------------------------
   // Timer / Clock Divider for SCL Generation (FIXED BUG #2, #3)
   //---------------------------------------------------------------------------
+
+  assign scl_stretched = (scl_o == 1'b1) && (scl_i == 1'b0);
 
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
@@ -192,8 +229,14 @@ module i2c_master_controller (
     end else if (timer_clr) begin
       timer     <= '0;
       timer_expired <= 1'b0;
+    end else if (scl_stretched) begin
+      // Freeze bit timing while the slave stretches SCL. Without this the
+      // FSM paced itself purely on the timer and would e.g. exit ACK_WAIT
+      // (reading a never-sampled ack_received == 0 -> "NACK") even though
+      // the 9th SCL pulse never actually happened on the wire.
+      timer_expired <= 1'b0;
     end else begin
-      if (timer == T_SCL_PERIOD - 1) begin
+      if (timer == TIMER_LAST) begin
         timer     <= '0;
         timer_expired <= 1'b1;
       end else begin
@@ -203,22 +246,28 @@ module i2c_master_controller (
     end
   end
 
-  assign timer_clr = (state != next_state); // Reset timer on state change
+  // Reset timer on state change. Combinational is safe here: timer_clr is
+  // only consumed synchronously, and all FSM inputs are registered (the bus
+  // inputs go through 2-flop synchronizers), so no glitch can be latched.
+  assign timer_clr = (state != next_state);
 
   //---------------------------------------------------------------------------
-  // Clock Stretch Detection (FIXED: uses stretch_cnt with timeout)
+  // Clock Stretch Detection
+  // FIX: only count cycles where the SLAVE is holding SCL low against our
+  // release (scl_o==1, wire low). The old version counted the master's own
+  // SCL-low half-periods as "stretching".
   //---------------------------------------------------------------------------
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       stretch_cnt <= '0;
-    end else if (scl_i == 1'b0 && state != STATE_IDLE) begin
+    end else if (scl_stretched && state != STATE_IDLE) begin
       stretch_cnt <= stretch_cnt + 1'b1;
     end else begin
       stretch_cnt <= '0;
     end
   end
 
-  assign timeout = (stretch_cnt >= MAX_CLK_STRETCH);
+  assign timeout = (stretch_cnt >= 16'(MAX_CLK_STRETCH));
 
   //---------------------------------------------------------------------------
   // SCL Generation Logic (FIXED BUG #2: SCL now toggles correctly)
@@ -236,26 +285,34 @@ module i2c_master_controller (
 
         // TX/RX Bit: Toggle SCL with proper timing
         STATE_TX_BIT: begin
-          if (timer < T_SCL_LOW)       scl_o <= 1'b0;    // SCL Low (data setup)
-          else if (timer < T_SCL_LOW + T_SCL_HIGH) scl_o <= 1'b1; // SCL High (sample window)
-          else                         scl_o <= 1'b0;
+          if (timer < SCL_LOW_TICKS)        scl_o <= 1'b0; // SCL Low (data setup)
+          else if (timer <= SCL_HI_END_TICKS) scl_o <= 1'b1; // SCL High (sample window)
+          else                              scl_o <= 1'b0;
         end
         STATE_RX_BIT: begin
-          if (timer < T_SCL_LOW)       scl_o <= 1'b0;    // Drive data / slave setup
-          else if (timer < T_SCL_LOW + T_SCL_HIGH) scl_o <= 1'b1; // Sample window
-          else                         scl_o <= 1'b0;
+          if (timer < SCL_LOW_TICKS)        scl_o <= 1'b0; // Drive data / slave setup
+          else if (timer <= SCL_HI_END_TICKS) scl_o <= 1'b1; // Sample window
+          else                              scl_o <= 1'b0;
         end
 
-        STATE_ACK_WAIT:     scl_o <= (timer < T_SCL_LOW) ? 1'b0 : 1'b1; // 9th bit ACK/NACK
-        STATE_ACK_SEND:     scl_o <= (timer < T_SCL_LOW) ? 1'b0 : 1'b1;
+        STATE_ACK_WAIT:     scl_o <= (timer < SCL_LOW_TICKS) ? 1'b0 : 1'b1; // 9th bit ACK/NACK
+        STATE_ACK_SEND:     scl_o <= (timer < SCL_LOW_TICKS) ? 1'b0 : 1'b1;
 
-        // STOP
+        // Holding the bus between bytes: SCL LOW keeps every slave frozen
+        // mid-transaction and prevents any implicit STOP when SDA releases.
+        STATE_BYTE_HOLD:    scl_o <= 1'b0;
+
+        // STOP: SCL must rise BEFORE SDA rises (FIX: the old 2-phase STOP
+        // raised both on the same edge — a same-cycle race at the slave).
         STATE_STOP_1:       scl_o <= 1'b0;
-        STATE_STOP_2:       scl_o <= 1'b1;               // SCL High for STOP
+        STATE_STOP_2:       scl_o <= 1'b1;               // SCL rises, SDA still low
+        STATE_STOP_3:       scl_o <= 1'b1;               // SDA rises now -> STOP
 
-        // Repeated START
-        STATE_REP_START_1:  scl_o <= 1'b1;               // SCL High, toggle SDA
-        STATE_REP_START_2:  scl_o <= 1'b0;               // SCL Low after Sr
+        // Repeated START: SDA must fall while SCL is ALREADY high (FIX: the
+        // old REP_START_2 dropped SCL and SDA on the same edge, so no Sr
+        // condition ever appeared on the wire).
+        STATE_REP_START_1:  scl_o <= 1'b1;               // SCL High, SDA high
+        STATE_REP_START_2:  scl_o <= 1'b1;               // SCL stays high for Sr edge
 
         default:            scl_o <= 1'b1;
       endcase
@@ -275,6 +332,7 @@ module i2c_master_controller (
         STATE_START_1:         sda_o <= 1'b0;           // SDA falls for START
         STATE_START_2:         sda_o <= 1'b0;           // Keep SDA LOW
         STATE_TX_BIT:          sda_o <= shift_reg[7];   // MSB first
+        STATE_BYTE_HOLD:       sda_o <= 1'b1;           // Release SDA (SCL is LOW — safe)
         STATE_ACK_WAIT:        sda_o <= 1'b1;           // Release SDA to let slave ACK
         STATE_ACK_SEND: begin
           // FIX: Differentiate ACK vs NACK based on command
@@ -283,10 +341,11 @@ module i2c_master_controller (
           else
             sda_o <= 1'b0;       // Drive ACK (LOW) — request more data from slave
         end
-        STATE_STOP_1:          sda_o <= 1'b0;           // SDA is LOW before rising
-        STATE_STOP_2:          sda_o <= 1'b1;           // SDA rises for STOP
+        STATE_STOP_1:          sda_o <= 1'b0;           // SDA LOW (setup)
+        STATE_STOP_2:          sda_o <= 1'b0;           // hold LOW while SCL rises
+        STATE_STOP_3:          sda_o <= 1'b1;           // SDA rises while SCL high
         STATE_REP_START_1:     sda_o <= 1'b1;           // SDA High before falling
-        STATE_REP_START_2:     sda_o <= 1'b0;           // SDA falls for Sr
+        STATE_REP_START_2:     sda_o <= 1'b0;           // SDA falls while SCL high = Sr
         default:               sda_o <= 1'b1;
       endcase
     end
@@ -300,8 +359,10 @@ module i2c_master_controller (
     if (!rst_n) begin
       shift_reg <= 8'h00;
     end else begin
-      // Load data for transmission
-      if (cpu_wr && (cpu_addr == REG_DATA)) begin
+      // Load data for transmission — only while the FSM is parked (IDLE or
+      // BYTE_HOLD). A REG_DATA write mid-byte must not clobber the shifter.
+      if (cpu_wr && (cpu_addr == REG_DATA) &&
+          (state == STATE_IDLE || state == STATE_BYTE_HOLD)) begin
         shift_reg <= cpu_wdata;
       end
       // Shift IN on SCL rising edge during RX
@@ -338,7 +399,7 @@ module i2c_master_controller (
       // DO NOT drive bit_cnt here — that caused a multi-driver violation.
 
       // Assert done for one cycle when STOP completes
-      done <= (state == STATE_STOP_2 && next_state == STATE_IDLE);
+      done <= (state == STATE_STOP_3 && next_state == STATE_IDLE);
 
       // FIX: ack/nack are now sticky — they persist until a new command starts
       if (state == STATE_ACK_WAIT && timer_expired) begin
@@ -347,8 +408,9 @@ module i2c_master_controller (
         // FIX: bus_error should NOT fire on NACK — NACK is a valid protocol response.
         // bus_error should only fire on timeout (actual protocol violation).
         bus_error <= 1'b0;
-      end else if (state == STATE_IDLE && cmd_valid) begin
-        // Clear sticky status when a new command begins
+      end else if ((state == STATE_IDLE || state == STATE_BYTE_HOLD) && cmd_valid) begin
+        // Clear sticky status when a new command begins (from IDLE or from
+        // the between-bytes hold state)
         ack       <= 1'b0;
         nack      <= 1'b0;
         bus_error <= 1'b0;
@@ -375,16 +437,11 @@ module i2c_master_controller (
         // STATE_IDLE
         //=====================================================================
         STATE_IDLE: begin
-          if (cmd_valid) begin
-            case (current_cmd)
-              CMD_START:    next_state = STATE_START_1;
-              CMD_WRITE:    next_state = STATE_TX_BIT;
-              CMD_READ_ACK: next_state = STATE_RX_BIT;
-              CMD_READ_NACK:next_state = STATE_RX_BIT;
-              CMD_STOP:     next_state = STATE_STOP_1;
-              CMD_REP_START:next_state = STATE_REP_START_1;
-              default:      next_state = STATE_IDLE;
-            endcase
+          // FIX: from IDLE we do not own the bus, so the ONLY legal command
+          // is CMD_START. (The old FSM happily clocked data bits onto SDA
+          // with no START condition — an invalid I2C transaction.)
+          if (cmd_valid && current_cmd == CMD_START) begin
+            next_state = STATE_START_1;
           end else begin
             next_state = STATE_IDLE;
           end
@@ -393,8 +450,8 @@ module i2c_master_controller (
         //=====================================================================
         // STATE_START_1 & _2
         //=====================================================================
-        STATE_START_1: next_state = timer_done ? STATE_START_2 : STATE_START_1;
-        STATE_START_2: next_state = timer_done ? STATE_TX_BIT  : STATE_START_2;
+        STATE_START_1: if (timer_done) next_state = STATE_START_2;
+        STATE_START_2: if (timer_done) next_state = STATE_TX_BIT;
 
         //=====================================================================
         // STATE_TX_BIT
@@ -427,7 +484,11 @@ module i2c_master_controller (
             next_state = STATE_IDLE;
           end else if (timer_done) begin
             if (ack_received) begin
-              next_state = STATE_IDLE; // Command complete
+              // FIX: byte complete — HOLD the bus (SCL low) and wait for the
+              // CPU's next command. The old FSM returned to IDLE here, which
+              // released SCL+SDA mid-transaction and forged a STOP on the
+              // wire, breaking every multi-byte write.
+              next_state = STATE_BYTE_HOLD;
             end else begin
               next_state = STATE_STOP_1; // NACK -> abort with STOP
             end
@@ -457,20 +518,45 @@ module i2c_master_controller (
         // Master drives ACK (LOW) or NACK (HIGH) after receiving byte.
         //=====================================================================
         STATE_ACK_SEND: begin
-          next_state = timer_done ? STATE_IDLE : STATE_ACK_SEND;
+          // FIX: as above — keep bus ownership after a received byte.
+          if (timer_done) next_state = STATE_BYTE_HOLD;
+        end
+
+        //=====================================================================
+        // STATE_BYTE_HOLD
+        // Between bytes of one transaction: SCL held LOW, SDA released.
+        // The CPU decides what happens next (next byte, Sr, or STOP).
+        //=====================================================================
+        STATE_BYTE_HOLD: begin
+          if (cmd_valid) begin
+            case (current_cmd)
+              CMD_WRITE:     next_state = STATE_TX_BIT;
+              CMD_READ_ACK:  next_state = STATE_RX_BIT;
+              CMD_READ_NACK: next_state = STATE_RX_BIT;
+              CMD_STOP:      next_state = STATE_STOP_1;
+              CMD_REP_START: next_state = STATE_REP_START_1;
+              CMD_ABORT:     next_state = STATE_IDLE;
+              default:       next_state = STATE_BYTE_HOLD;
+            endcase
+          end else begin
+            next_state = STATE_BYTE_HOLD;
+          end
         end
 
         //=====================================================================
         // STATE_STOP_1 & _2
         //=====================================================================
-        STATE_STOP_1: next_state = timer_done ? STATE_STOP_2 : STATE_STOP_1;
-        STATE_STOP_2: next_state = timer_done ? STATE_IDLE   : STATE_STOP_2;
+        STATE_STOP_1: if (timer_done) next_state = STATE_STOP_2;
+        STATE_STOP_2: if (timer_done) next_state = STATE_STOP_3;
+        STATE_STOP_3: if (timer_done) next_state = STATE_IDLE;
 
         //=====================================================================
         // STATE_REP_START_1 & _2
         //=====================================================================
-        STATE_REP_START_1: next_state = timer_done ? STATE_REP_START_2 : STATE_REP_START_1;
-        STATE_REP_START_2: next_state = timer_done ? STATE_TX_BIT      : STATE_REP_START_2;
+        STATE_REP_START_1: if (timer_done) next_state = STATE_REP_START_2;
+        // After the Sr edge, reuse START_2 to bring SCL low before clocking
+        // out the (re-)addressed byte.
+        STATE_REP_START_2: if (timer_done) next_state = STATE_START_2;
 
         default: next_state = STATE_IDLE;
 
@@ -514,14 +600,28 @@ module i2c_master_controller (
   // On arb_lost: FSM returns to IDLE without driving STOP — releasing the bus
   // is the correct multi-master courtesy (the winning master continues).
   //---------------------------------------------------------------------------
-  logic arb_lost_reg;
+  // sda_i/scl_i are 2-flop-synchronized (2 clk behind the wire), so the
+  // wired-AND comparison must use an equally delayed copy of our own drive
+  // value. Comparing raw sda_o against the delayed sda_i fires a false
+  // arb-loss on every 0->1 data-bit transition.
+  logic sda_o_d1, sda_o_d2;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      sda_o_d1 <= 1'b1;
+      sda_o_d2 <= 1'b1;
+    end else begin
+      sda_o_d1 <= sda_o;
+      sda_o_d2 <= sda_o_d1;
+    end
+  end
 
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       arb_lost_reg <= 1'b0;
     end else if (state == STATE_IDLE) begin
       arb_lost_reg <= 1'b0;  // clear on idle
-    end else if ((state == STATE_TX_BIT) && (sda_o == 1'b1) && (sda_i == 1'b0) && (scl_i == 1'b1)) begin
+    end else if ((state == STATE_TX_BIT) && (sda_o_d2 == 1'b1) && (sda_i == 1'b0) && (scl_i == 1'b1)) begin
       arb_lost_reg <= 1'b1;
     end
   end
@@ -536,13 +636,16 @@ module i2c_master_controller (
       reg_status <= 8'h00;
     end else begin
       case (state)
-        STATE_IDLE:                                reg_status <= STS_IDLE;
-        STATE_TX_BIT, STATE_RX_BIT, STATE_ACK_WAIT: reg_status <= STS_BUSY;
-        STATE_STOP_2:                              reg_status <= STS_DONE;
-        default:                                   reg_status <= reg_status;
+        STATE_IDLE:      reg_status <= {5'd0, STS_IDLE};
+        // Between bytes: report the outcome of the byte that just finished
+        // so the CPU can poll for ACK/NACK before issuing the next command.
+        STATE_BYTE_HOLD: reg_status <= nack ? {5'd0, STS_NACK} : {5'd0, STS_ACK};
+        STATE_STOP_3:    reg_status <= {5'd0, STS_DONE};
+        default:         reg_status <= {5'd0, STS_BUSY};
       endcase
-      // Override with STS_ARB_LOST whenever arbitration loss is asserted
-      if (arb_lost_reg) reg_status <= STS_ARB_LOST;
+      // Overrides, highest priority last
+      if (timeout)      reg_status <= {5'd0, STS_TIMEOUT};
+      if (arb_lost_reg) reg_status <= {5'd0, STS_ARB_LOST};
     end
   end
 
@@ -551,17 +654,20 @@ module i2c_master_controller (
     if (!rst_n) begin
       cpu_irq <= 1'b0;
     end else begin
-      cpu_irq <= |({reg_irq_en[0] & done,
-                    reg_irq_en[1] & ack,
-                    reg_irq_en[2] & nack,
-                    reg_irq_en[3] & timeout,
-                    reg_irq_en[4] & bus_error});
+      // Bit positions match i2c_pkg::i2c_irq_e (IRQ_DONE=0 ... IRQ_ARB_LOST=5)
+      cpu_irq <= |({reg_irq_en[IRQ_DONE]      & done,
+                    reg_irq_en[IRQ_ACK]       & ack,
+                    reg_irq_en[IRQ_NACK]      & nack,
+                    reg_irq_en[IRQ_TIMEOUT]   & timeout,
+                    reg_irq_en[IRQ_BUS_ERROR] & bus_error,
+                    reg_irq_en[IRQ_ARB_LOST]  & arb_lost_reg});
     end
   end
 
 endmodule
 
 `endif
+
 //=============================================================================
 // File          : i2c_master.sv
 // Description   : Top-level I2C Master wrapper
@@ -621,6 +727,7 @@ module i2c_master (
 endmodule
 
 `endif
+
 //=============================================================================
 // File          : i2c_slave_controller.sv (FIXED)
 // Description   : Synthesizable I2C Slave Controller (FIXED)
@@ -679,8 +786,30 @@ module i2c_slave_controller
   assign sda = (sda_o == 1'b0) ? 1'b0 : 1'bz;
   // FIX: SCL is also open-drain, drive 0 for stretch, z to release
   assign scl = (scl_o == 1'b0) ? 1'b0 : 1'bz;
-  assign sda_i = sda;
-  assign scl_i = scl;
+
+  // SCL/SDA are asynchronous to clk (driven by an external master). Two-flop
+  // synchronizers guard the edge detectors and FSM against metastability.
+  // All downstream logic sees the bus with 2 cycles of latency, which is
+  // negligible against the shortest legal SCL phase.
+  logic scl_meta, scl_sync;
+  logic sda_meta, sda_sync;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      scl_meta <= 1'b1;
+      scl_sync <= 1'b1;
+      sda_meta <= 1'b1;
+      sda_sync <= 1'b1;
+    end else begin
+      scl_meta <= scl;
+      scl_sync <= scl_meta;
+      sda_meta <= sda;
+      sda_sync <= sda_meta;
+    end
+  end
+
+  assign sda_i = sda_sync;
+  assign scl_i = scl_sync;
 
   // FSM States
   typedef enum logic [3:0] {
@@ -692,8 +821,7 @@ module i2c_slave_controller
     SLV_RX_ACK,
     SLV_TX,
     SLV_TX_ACK,
-    SLV_STRETCH,
-    SLV_STOP
+    SLV_STRETCH
   } slv_state_e;
 
   slv_state_e state, next_state;
@@ -717,6 +845,7 @@ module i2c_slave_controller
   logic       stretch_active;
   logic       stretch_en_d;    // FIX: edge detect to prevent infinite re-trigger
   logic       stretch_en_rise;
+  logic       stretch_pending; // armed request waiting for a transaction
 
   // Internal register bank
   logic [7:0] internal_regs [0:7];
@@ -814,7 +943,9 @@ module i2c_slave_controller
     if (!rst_n) begin
       reg_ptr <= 3'd0;
       reg_ptr_inc_done <= 1'b0;
-    end else if (state == SLV_ACK && addr_matched) begin
+    end else if (state != SLV_ACK && next_state == SLV_ACK && addr_matched) begin
+      // Reset on ENTRY to SLV_ACK only (not every cycle in the state) so a
+      // stretch-resume into SLV_ACK cannot zero the pointer mid-transaction.
       reg_ptr <= 3'd0;
     end else if (state == SLV_RX_ACK && active_int && rx_rw == 1'b0 && !reg_ptr_inc_done) begin
       reg_ptr <= reg_ptr + 1'b1;
@@ -896,6 +1027,11 @@ module i2c_slave_controller
   //*******************************************************************
   // SDA Output Logic (Open-Drain) (FIXED for TX)
   //*******************************************************************
+  // I2C data-validity rule (UM10204 3.1.3): SDA may only change while SCL is
+  // LOW. In the driving states we therefore gate every sda_o update on
+  // scl_i == 0 and HOLD the current value through the SCL-high window.
+  // Non-driving states release unconditionally (the bus is already past the
+  // window where a release could forge a START/STOP).
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       sda_o <= 1'b1;
@@ -903,24 +1039,38 @@ module i2c_slave_controller
       case (state)
         // ACK: drive SDA LOW during 9th clock
         SLV_ACK: begin
-          if (addr_matched) sda_o <= 1'b0; // ACK (match found)
-          else              sda_o <= 1'b1; // NACK (no match)
+          if (scl_i == 1'b0) begin
+            if (addr_matched) sda_o <= 1'b0; // ACK (match found)
+            else              sda_o <= 1'b1; // NACK (no match)
+          end
         end
 
         // RX ACK: send ACK for received byte
         SLV_RX_ACK: begin
-          if (active_int && !force_data_nack) sda_o <= 1'b0; // ACK
-          else                                 sda_o <= 1'b1; // NACK
+          if (scl_i == 1'b0) begin
+            if (active_int && !force_data_nack) sda_o <= 1'b0; // ACK
+            else                                 sda_o <= 1'b1; // NACK
+          end
         end
 
         // FIX TX: Slave drives DATA bit from tx_shift_reg in read mode
         SLV_TX: begin
-          if (active_int) begin
-            sda_o <= tx_shift_reg[7]; // MSB first from shift register
-          end else begin
-            sda_o <= 1'b1;
+          if (scl_i == 1'b0) begin
+            if (active_int) begin
+              sda_o <= tx_shift_reg[7]; // MSB first from shift register
+            end else begin
+              sda_o <= 1'b1;
+            end
           end
         end
+
+        // FIX (EP live-run): HOLD sda_o while stretching. A slave that
+        // stretches the clock during an ACK/data bit must keep SDA stable —
+        // it has only paused the clock, not released the bus. The old code
+        // let SLV_STRETCH fall into `default: sda_o <= 1` and RELEASED the
+        // ACK mid-stretch, so a monitor sampling at the SCL rising edge read
+        // a NACK and derailed. Empty statement = the flop holds its value.
+        SLV_STRETCH: /* hold sda_o */ ;
 
         default: sda_o <= 1'b1; // Release SDA (open-drain high)
       endcase
@@ -964,19 +1114,32 @@ module i2c_slave_controller
   end
   assign stretch_en_rise = stretch_en && !stretch_en_d;
 
+  // FIX (post-audit): the old logic required stretch_en_rise AND active_int
+  // in the same cycle. Testbenches arm stretch_en BEFORE the transaction
+  // begins (active_int == 0), so the edge was swallowed and the slave never
+  // actually stretched. A pending latch keeps the armed request until a
+  // transaction is active, while still preventing level re-triggering.
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-      stretch_timer  <= 16'd0;
-      stretch_active <= 1'b0;
-    end else if (stretch_en_rise && !stretch_active && active_int) begin
-      // FIX: Only trigger on RISING EDGE of stretch_en, not level
-      stretch_active <= 1'b1;
-      stretch_timer  <= 16'd1;  // FIX BUG #15: start at 1 for exact stretch_cycles duration
-    end else if (stretch_active) begin
-      if (stretch_timer >= stretch_cycles) begin
-        stretch_active <= 1'b0;
-      end else begin
-        stretch_timer <= stretch_timer + 1'b1;
+      stretch_timer   <= 16'd0;
+      stretch_active  <= 1'b0;
+      stretch_pending <= 1'b0;
+    end else begin
+      if (stretch_en_rise) begin
+        stretch_pending <= 1'b1;  // arm on rising edge only (no re-trigger)
+      end
+
+      if (stretch_active) begin
+        if (stretch_timer >= stretch_cycles) begin
+          stretch_active <= 1'b0;
+        end else begin
+          stretch_timer <= stretch_timer + 1'b1;
+        end
+      end else if (stretch_pending && active_int) begin
+        stretch_active  <= 1'b1;
+        stretch_pending <= 1'b0;
+        // FIX BUG #15: start at 1 so >= fires after exactly stretch_cycles.
+        stretch_timer   <= 16'd1;
       end
     end
   end
@@ -989,7 +1152,10 @@ module i2c_slave_controller
       state <= SLV_IDLE;
       saved_state <= SLV_IDLE;
     end else begin
-      if (stretch_active && state != SLV_STRETCH)
+      // Capture the resume point exactly on the transition INTO SLV_STRETCH.
+      // (The old `stretch_active && state != SLV_STRETCH` form could capture
+      // one cycle late and resume into an already-advanced state.)
+      if (next_state == SLV_STRETCH && state != SLV_STRETCH)
         saved_state <= state;
       state <= next_state;
     end
@@ -1009,10 +1175,11 @@ module i2c_slave_controller
       case (state)
       //==================================================================
       // SLV_IDLE: Waiting for a START condition from the master.
+      // NOTE: start_cond is already checked above the case statement,
+      // so this branch only handles the no-start case.
       //==================================================================
       SLV_IDLE: begin
-        if (start_cond) next_state = SLV_START;
-        else           next_state = SLV_IDLE;
+        next_state = SLV_IDLE;
       end
 
       //==================================================================
@@ -1063,13 +1230,12 @@ module i2c_slave_controller
 
       //==================================================================
       // SLV_RX_ACK: Send ACK after receiving a byte.
+      // NOTE: START/STOP are handled by the priority override at the top
+      // of this block — no per-state checks needed (the old inner branches
+      // were unreachable dead code).
       //==================================================================
       SLV_RX_ACK: begin
-        if (stop_cond) begin
-          next_state = SLV_STOP;
-        end else if (start_cond) begin
-          next_state = SLV_START; // Repeated START
-        end else if (scl_fall) begin
+        if (scl_fall) begin
           next_state = SLV_RX; // Ready for another byte
         end else begin
           next_state = SLV_RX_ACK;
@@ -1091,11 +1257,7 @@ module i2c_slave_controller
       // SLV_TX_ACK: Wait for ACK/NACK from the master.
       //==================================================================
       SLV_TX_ACK: begin
-        if (stop_cond) begin
-          next_state = SLV_STOP;
-        end else if (start_cond) begin
-          next_state = SLV_START; // Repeated START
-        end else if (scl_fall) begin
+        if (scl_fall) begin
           if (sda_i == 1'b0) next_state = SLV_TX;
           else                next_state = SLV_IDLE;
         end else begin
@@ -1115,13 +1277,6 @@ module i2c_slave_controller
         end
       end
 
-      //==================================================================
-      // SLV_STOP: STOP condition detected. Release bus.
-      //==================================================================
-      SLV_STOP: begin
-        next_state = SLV_IDLE;
-      end
-
       default: next_state = SLV_IDLE;
 
       endcase
@@ -1134,7 +1289,16 @@ module i2c_slave_controller
   //*******************************************************************
   // Status & Interrupts
   //*******************************************************************
-  assign rx_data_valid = (state == SLV_RX_ACK) && active_int;
+  // One-cycle strobe: internal_updated[i] pulses for exactly one clk on the
+  // cycle a byte is committed to the register bank (the old level-version
+  // stayed high for the whole multi-cycle SLV_RX_ACK state and would
+  // double-push into any external FIFO).
+  always_comb begin
+    rx_data_valid = 1'b0;
+    for (int i = 0; i < 8; i++) begin
+      if (internal_updated[i]) rx_data_valid = 1'b1;
+    end
+  end
   assign rx_data       = latched_rx_byte; // FIX: use latched byte instead of shift_reg
   assign tx_ack        = (state == SLV_TX_ACK && sda_i == 1'b0 && active_int);
   assign tx_nack       = (state == SLV_TX_ACK && sda_i == 1'b1 && active_int);
@@ -1144,6 +1308,7 @@ module i2c_slave_controller
 endmodule
 
 `endif
+
 //=============================================================================
 // File          : i2c_slave.sv
 // Description   : Top-level I2C Slave wrapper with parameterizable address.

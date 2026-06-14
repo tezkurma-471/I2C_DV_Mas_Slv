@@ -54,10 +54,12 @@ class i2c_monitor extends uvm_monitor;
 
     forever begin
       @(posedge vif.clk);
-      // SCL stretch detection: >260 consecutive LOW cycles = slave is stretching
+      // SCL stretch detection: the BFM's normal SCL-low phase is
+      // BIT_HOLD+BIT_SETUP (~16) cycles, so >64 consecutive LOW cycles
+      // means the slave is holding the clock.
       if (vif.scl === 1'b0) scl_low_cnt++;
       else                   scl_low_cnt = 0;
-      if (in_transaction && scl_low_cnt > 260 && current_item != null)
+      if (in_transaction && scl_low_cnt > 64 && current_item != null)
         current_item.stretch_seen = 1'b1;
 
       // START detection: SDA falls while SCL is HIGH

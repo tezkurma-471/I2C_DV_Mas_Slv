@@ -1,16 +1,15 @@
+//=============================================================================
+// GENERATED FILE — do not edit. Rebuild with scripts/build_eda_playground.sh
+// Source of truth: rtl/ tb/ uvm/ sva/ in the project tree.
+//=============================================================================
+// NOTE: comments stripped to fit EDA Playground's 100k-char file limit.
+// The fully commented sources are in uvm/ in the project repository.
 `ifndef I2C_TB_PKG_SV
 `define I2C_TB_PKG_SV
 package i2c_tb_pkg;
   import uvm_pkg::*;
   `include "uvm_macros.svh"
   import i2c_pkg::*;
-//=============================================================================
-// File          : i2c_seq_item.sv
-// Description   : UVM Sequence Item for I2C Transactions
-//               : Encapsulates all fields of an I2C protocol transaction.
-//               : V2: Added addr_ack, byte_ack[] for per-byte ACK tracking.
-// Language      : SystemVerilog (IEEE 1800-2012) + UVM 1.2
-//=============================================================================
 
 `ifndef I2C_SEQ_ITEM_SV
 `define I2C_SEQ_ITEM_SV
@@ -32,15 +31,12 @@ class i2c_seq_item extends uvm_sequence_item;
   i2c_status_e      status;
   bit               ack_received;
 
-  // Per-byte ACK/NACK tracking (populated by monitor)
   bit               addr_ack;
   bit               byte_ack [$];
 
-  // Error injection
   rand bit          inject_nack;
   rand bit          inject_timeout;
 
-  // Monitor-populated fields for enhanced coverage
   int  num_rep_starts;   // rep-START chain depth: 0=direct START, 1+=chain position
   bit  stretch_seen;     // 1 if SCL was held LOW beyond T_SCL_LOW during this transaction
 
@@ -63,10 +59,6 @@ class i2c_seq_item extends uvm_sequence_item;
     rep_start  == 0;
   }
 
-  // FIX: Every I2C transaction MUST begin with START or Repeated START.
-  // Without this, random/stress sequences generate impossible bus states.
-  // NOTE: stop_cond=1 with rep_start=1 IS valid — it marks the final segment
-  // of a repeated-START chain (driver generates REP_START, then ends with STOP).
   constraint valid_protocol_c {
     start_cond || rep_start;     // Must have at least one
     !(start_cond && rep_start);  // Cannot have both simultaneously
@@ -128,7 +120,6 @@ class i2c_seq_item extends uvm_sequence_item;
   virtual function bit do_compare(uvm_object rhs, uvm_comparer comparer);
     i2c_seq_item item;
     if (!$cast(item, rhs)) return 0;
-    // FIX: Also compare status fields for thorough checking
     return (super.do_compare(rhs, comparer) &&
             (addr == item.addr) &&
             (dir  == item.dir) &&
@@ -152,14 +143,6 @@ endclass : i2c_seq_item
 
 `endif
 
-//=============================================================================
-// File          : i2c_scoreboard.sv
-// Description   : UVM Scoreboard — True Self-Checking Reference Model
-//               : V2: Checks address ACK/NACK, data integrity, register
-//               : contents, and expected vs actual transaction counts.
-// Language      : SystemVerilog (IEEE 1800-2012) + UVM 1.2
-//=============================================================================
-
 `ifndef I2C_SCOREBOARD_SV
 `define I2C_SCOREBOARD_SV
 
@@ -173,13 +156,17 @@ class i2c_scoreboard extends uvm_scoreboard;
   uvm_analysis_imp_expected #(i2c_seq_item, i2c_scoreboard) expected_export;
   uvm_analysis_imp_actual   #(i2c_seq_item, i2c_scoreboard) actual_export;
 
+  i2c_seq_item exp_q [$];
+  i2c_seq_item act_q [$];
+
   logic [7:0] ref_reg_bank [0:7];
-  int         shadow_ptr;
 
   int expected_count;
   int actual_count;
   int error_count;
   int match_count;
+
+  bit allow_bus_corruption;
 
   function new(string name = "i2c_scoreboard", uvm_component parent = null);
     super.new(name, parent);
@@ -191,45 +178,128 @@ class i2c_scoreboard extends uvm_scoreboard;
     actual_export   = new("actual_export",   this);
     for (int i = 0; i < 8; i++)
       ref_reg_bank[i] = 8'h00;
-    shadow_ptr     = 0;
     expected_count = 0;
     actual_count   = 0;
     error_count    = 0;
     match_count    = 0;
+    void'(uvm_config_db#(bit)::get(this, "", "allow_bus_corruption", allow_bus_corruption));
+    if (allow_bus_corruption)
+      `uvm_info(get_type_name(),
+                "allow_bus_corruption set — intent-vs-wire checks suppressed", UVM_LOW)
   endfunction
 
   virtual function void write_expected(i2c_seq_item item);
     expected_count++;
     `uvm_info(get_type_name(),
-              $sformatf("EXPECTED[%0d]: addr=0x%02x dir=%s bytes=%0d",
-                        expected_count, item.addr, item.dir.name(), item.num_data), UVM_HIGH)
-
-    // FIX: Only update shadow for target address writes
-    // FIX: Do NOT reset shadow_ptr to 0 — it persists across transactions
-    //      just like the DUT's reg_ptr auto-increments continuously.
-    //      The DUT resets reg_ptr to 0 in SLV_ACK when address matches,
-    //      so we must reset here too on EACH new transaction to addr 0x50.
-    if (item.dir == DIR_WRITE && item.addr == 7'h50) begin
-      shadow_ptr = 0;  // Reset: DUT does reg_ptr <= 0 in SLV_ACK
-      foreach (item.data[i]) begin
-        ref_reg_bank[shadow_ptr % 8] = item.data[i];
-        `uvm_info(get_type_name(),
-                  $sformatf("SHADOW WRITE: reg[%0d] = 0x%02x",
-                            shadow_ptr % 8, item.data[i]), UVM_HIGH)
-        shadow_ptr++;
-      end
-    end
+              $sformatf("EXPECTED[%0d]: %s", expected_count, item.convert2string()), UVM_HIGH)
+    exp_q.push_back(item);
+    try_match();
   endfunction
 
   virtual function void write_actual(i2c_seq_item item);
     actual_count++;
     `uvm_info(get_type_name(),
-              $sformatf("ACTUAL[%0d]: addr=0x%02x dir=%s bytes=%0d addr_ack=%0b",
-                        actual_count, item.addr, item.dir.name(),
-                        item.num_data, item.addr_ack), UVM_MEDIUM)
+              $sformatf("ACTUAL[%0d]: %s", actual_count, item.convert2string()), UVM_MEDIUM)
+    act_q.push_back(item);
+    try_match();
+  endfunction
 
-    check_address_ack(item);
-    check_data_integrity(item);
+  virtual function void try_match();
+    while (exp_q.size() > 0 && act_q.size() > 0) begin
+      i2c_seq_item exp = exp_q.pop_front();
+      i2c_seq_item act = act_q.pop_front();
+      compare_pair(exp, act);
+    end
+  endfunction
+
+  virtual function void compare_pair(i2c_seq_item exp, i2c_seq_item act);
+    bit pair_ok = 1;
+
+    if (allow_bus_corruption) begin
+      match_count++;
+      `uvm_info(get_type_name(),
+                $sformatf("PAIR (corruption-tolerant): %s", act.convert2string()), UVM_MEDIUM)
+      return;
+    end
+
+    if (exp.addr !== act.addr) begin
+      `uvm_error(get_type_name(),
+                 $sformatf("ADDR MISMATCH: drove 0x%02x, monitor saw 0x%02x", exp.addr, act.addr))
+      error_count++; pair_ok = 0;
+    end
+    if (exp.dir != act.dir) begin
+      `uvm_error(get_type_name(),
+                 $sformatf("DIR MISMATCH: drove %s, monitor saw %s", exp.dir.name(), act.dir.name()))
+      error_count++; pair_ok = 0;
+    end
+
+    check_address_ack(act);
+
+    if (exp.addr_ack !== act.addr_ack) begin
+      `uvm_error(get_type_name(),
+                 $sformatf("ADDR_ACK INCONSISTENT: driver sampled %0b, monitor saw %0b",
+                           exp.addr_ack, act.addr_ack))
+      error_count++; pair_ok = 0;
+    end
+
+    if (!exp.addr_ack) begin
+      if (act.data.size() > 0) begin
+        `uvm_error(get_type_name(),
+                   $sformatf("NACK'd address 0x%02x but %0d data byte(s) appeared on the bus",
+                             act.addr, act.data.size()))
+        error_count++; pair_ok = 0;
+      end
+    end else begin
+      foreach (act.data[i]) begin
+        if ($isunknown(act.data[i])) begin
+          `uvm_error(get_type_name(),
+                     $sformatf("DATA byte[%0d] = X/Z for addr=0x%02x", i, act.addr))
+          error_count++; pair_ok = 0;
+        end
+      end
+
+      if (exp.data.size() != act.data.size()) begin
+        `uvm_error(get_type_name(),
+                   $sformatf("PAYLOAD SIZE MISMATCH: drove %0d byte(s), monitor saw %0d",
+                             exp.data.size(), act.data.size()))
+        error_count++; pair_ok = 0;
+      end else begin
+        foreach (exp.data[i]) begin
+          if (exp.data[i] !== act.data[i]) begin
+            `uvm_error(get_type_name(),
+                       $sformatf("%s DATA MISMATCH byte[%0d]: driver 0x%02x vs monitor 0x%02x",
+                                 exp.dir.name(), i, exp.data[i], act.data[i]))
+            error_count++; pair_ok = 0;
+          end
+        end
+      end
+
+      if (act.addr == 7'h50 && act.addr_ack) begin
+        if (act.dir == DIR_READ) begin
+          foreach (act.data[i]) begin
+            logic [7:0] expected_val = ref_reg_bank[i % 8];
+            if (act.data[i] !== expected_val) begin
+              `uvm_error(get_type_name(),
+                         $sformatf("READ MISMATCH reg[%0d]: shadow=0x%02x bus=0x%02x",
+                                   i % 8, expected_val, act.data[i]))
+              error_count++; pair_ok = 0;
+            end
+          end
+        end else begin
+          foreach (act.data[i]) begin
+            ref_reg_bank[i % 8] = act.data[i];
+            `uvm_info(get_type_name(),
+                      $sformatf("SHADOW WRITE: reg[%0d] = 0x%02x", i % 8, act.data[i]), UVM_HIGH)
+          end
+        end
+      end
+    end
+
+    if (pair_ok) begin
+      match_count++;
+      `uvm_info(get_type_name(),
+                $sformatf("MATCH[%0d]: %s", match_count, act.convert2string()), UVM_HIGH)
+    end
   endfunction
 
   virtual function void check_address_ack(i2c_seq_item item);
@@ -239,60 +309,27 @@ class i2c_scoreboard extends uvm_scoreboard;
                  $sformatf("ADDR_ACK MISMATCH: addr=0x%02x expected_ack=%0b actual_ack=%0b",
                            item.addr, expected_ack, item.addr_ack))
       error_count++;
-    end else begin
-      `uvm_info(get_type_name(),
-                $sformatf("ADDR_ACK OK: addr=0x%02x ack=%0b", item.addr, item.addr_ack), UVM_HIGH)
-      match_count++;
     end
   endfunction
 
-  virtual function void check_data_integrity(i2c_seq_item item);
-    if (item.addr != 7'h50) begin
-      if (item.num_data > 0 && item.addr_ack) begin
-        `uvm_error(get_type_name(),
-                   $sformatf("DATA from NACK'd address 0x%02x — should have no data", item.addr))
-        error_count++;
-      end
-      return;
+  virtual function void check_phase(uvm_phase phase);
+    super.check_phase(phase);
+    if (exp_q.size() > 0) begin
+      `uvm_error(get_type_name(),
+                 $sformatf("%0d expected transaction(s) never observed on the bus", exp_q.size()))
+      error_count += exp_q.size();
     end
-
-    if (!item.addr_ack) return;
-
-    foreach (item.data[i]) begin
-      if ($isunknown(item.data[i])) begin
-        `uvm_error(get_type_name(),
-                   $sformatf("DATA byte[%0d] = X/Z for addr=0x%02x", i, item.addr))
-        error_count++;
-        return;
-      end
-    end
-
-    if (item.dir == DIR_WRITE) begin
-      match_count++;
-    end else if (item.dir == DIR_READ) begin
-      // FIX: DUT resets reg_ptr to 0 in SLV_ACK on each new address match
-      int rd_ptr = 0;
-      foreach (item.data[i]) begin
-        logic [7:0] expected_val = ref_reg_bank[rd_ptr % 8];
-        if (item.data[i] !== expected_val) begin
-          `uvm_error(get_type_name(),
-                     $sformatf("READ MISMATCH reg[%0d]: expected=0x%02x actual=0x%02x",
-                               rd_ptr % 8, expected_val, item.data[i]))
-          error_count++;
-        end else begin
-          `uvm_info(get_type_name(),
-                    $sformatf("READ MATCH reg[%0d] = 0x%02x", rd_ptr % 8, item.data[i]), UVM_HIGH)
-          match_count++;
-        end
-        rd_ptr++;
-      end
+    if (act_q.size() > 0) begin
+      `uvm_error(get_type_name(),
+                 $sformatf("%0d bus transaction(s) had no matching expected item", act_q.size()))
+      error_count += act_q.size();
     end
   endfunction
 
   virtual function void report_phase(uvm_phase phase);
     super.report_phase(phase);
     `uvm_info(get_type_name(),
-              $sformatf("\n========== SCOREBOARD REPORT ==========\n  Expected Transactions : %0d\n  Actual Transactions   : %0d\n  Matches               : %0d\n  Errors                : %0d\n========================================",
+              $sformatf("\n========== SCOREBOARD REPORT ==========\n  Expected Transactions : %0d\n  Actual Transactions   : %0d\n  Matched Pairs         : %0d\n  Errors                : %0d\n========================================",
                 expected_count, actual_count, match_count, error_count),
               UVM_LOW)
 
@@ -302,7 +339,6 @@ class i2c_scoreboard extends uvm_scoreboard;
     end else if (actual_count == 0) begin
       `uvm_error(get_type_name(), "SCOREBOARD FAILED: No actual transactions received!")
     end else if (actual_count != expected_count) begin
-      // FIX: Flag mismatch in either direction as error, not just warning
       `uvm_error(get_type_name(),
                  $sformatf("SCOREBOARD FAILED: Expected %0d but got %0d actual transactions.",
                            expected_count, actual_count))
@@ -314,14 +350,6 @@ class i2c_scoreboard extends uvm_scoreboard;
 endclass : i2c_scoreboard
 
 `endif
-
-//=============================================================================
-// File          : i2c_monitor.sv
-// Description   : UVM Monitor for I2C Bus
-//               : Passively watches SDA/SCL, reconstructs transactions.
-//               : V2: Tracks per-byte ACK/NACK, handles repeated START.
-// Language      : SystemVerilog (IEEE 1800-2012) + UVM 1.2
-//=============================================================================
 
 `ifndef I2C_MONITOR_SV
 `define I2C_MONITOR_SV
@@ -371,16 +399,13 @@ class i2c_monitor extends uvm_monitor;
 
     forever begin
       @(posedge vif.clk);
-      // SCL stretch detection: >260 consecutive LOW cycles = slave is stretching
       if (vif.scl === 1'b0) scl_low_cnt++;
       else                   scl_low_cnt = 0;
-      if (in_transaction && scl_low_cnt > 260 && current_item != null)
+      if (in_transaction && scl_low_cnt > 64 && current_item != null)
         current_item.stretch_seen = 1'b1;
 
-      // START detection: SDA falls while SCL is HIGH
       if (vif.sda === 1'b0 && prev_sda === 1'b1 && vif.scl === 1'b1) begin
         if (in_transaction && current_item != null) begin
-          // This is a Repeated START — finalize the current item first
           `uvm_info(get_type_name(), "Repeated START detected mid-transaction", UVM_MEDIUM)
           finalize_and_write_item();
           saw_rep_start = 1;  // FIX: flag for the NEW item
@@ -396,7 +421,6 @@ class i2c_monitor extends uvm_monitor;
         current_item.start_cond = 1;
         current_item.stop_cond  = 0;
         current_item.rep_start  = saw_rep_start;  // FIX: properly flag Repeated START
-        // Track rep-START chain depth for coverage
         if (saw_rep_start) begin
           rep_start_chain_depth++;
           current_item.num_rep_starts = rep_start_chain_depth;
@@ -406,7 +430,6 @@ class i2c_monitor extends uvm_monitor;
         end
       end
 
-      // STOP detection: SDA rises while SCL is HIGH
       if (vif.sda === 1'b1 && prev_sda === 1'b0 && vif.scl === 1'b1) begin
         if (in_transaction) begin
           `uvm_info(get_type_name(), "STOP condition detected", UVM_MEDIUM)
@@ -421,7 +444,6 @@ class i2c_monitor extends uvm_monitor;
         end
       end
 
-      // Data sampling on SCL rising edge
       if (in_transaction && vif.scl === 1'b1 && prev_scl === 1'b0) begin
         if (bit_cnt < 8) begin
           shift_reg = {shift_reg[6:0], vif.sda};
@@ -462,7 +484,6 @@ class i2c_monitor extends uvm_monitor;
     end
   endtask
 
-  // FIX: Allow items with no data bytes (e.g., NACK'd address-only transactions)
   virtual task finalize_and_write_item();
     if (current_item != null) begin
       if (current_item.addr != 0 || current_item.data.size() > 0) begin
@@ -481,15 +502,6 @@ endclass : i2c_monitor
 
 `endif
 
-//=============================================================================
-// File          : i2c_master_driver.sv (FIXED)
-// Description   : UVM Driver for I2C Master (FIXED)
-//               : Converts sequence-level transactions to pin-level bus activity.
-//               : Uses clock-based timing and proper open-drain release.
-//               : FIX: Added req_analysis_port for scoreboard expected data.
-// Language      : SystemVerilog (IEEE 1800-2012) + UVM 1.2
-//=============================================================================
-
 `ifndef I2C_MASTER_DRIVER_SV
 `define I2C_MASTER_DRIVER_SV
 
@@ -500,6 +512,11 @@ class i2c_driver extends uvm_driver #(i2c_seq_item);
   virtual i2c_if vif;
 
   uvm_analysis_port #(i2c_seq_item) req_analysis_port;
+
+  localparam int BIT_HOLD   = T_HD_DAT + 3;  // SDA stable after SCL falls
+  localparam int BIT_SETUP  = T_SU_DAT + 3;  // SDA stable before SCL rises
+  localparam int SCL_HIGH_N = 6;             // SCL high time per bit
+  localparam int BUS_FREE_N = T_BUF + 6;     // bus-free time after STOP (A7)
 
   function new(string name = "i2c_driver", uvm_component parent = null);
     super.new(name, parent);
@@ -523,199 +540,186 @@ class i2c_driver extends uvm_driver #(i2c_seq_item);
       seq_item_port.get_next_item(req_item);
       `uvm_info(get_type_name(), $sformatf("Got item: %s", req_item.convert2string()), UVM_MEDIUM)
 
-      // FIX: DO NOT write to analysis port here. Write AFTER transaction completes.
+      drive_item(req_item);
 
-      // Execute transaction
-      if (req_item.start_cond && !req_item.rep_start) begin
-        send_start();
-      end else if (req_item.rep_start) begin
-        send_rep_start();
-      end
-
-      if (req_item.start_cond || req_item.rep_start) begin
-        send_byte({req_item.addr, logic'(req_item.dir)});
-        wait_for_ack();
-      end
-
-      if (req_item.dir == DIR_WRITE) begin
-        foreach (req_item.data[i]) begin
-          send_byte(req_item.data[i]);
-          wait_for_ack();
-        end
-      end else begin
-        for (int i = 0; i < req_item.data.size(); i++) begin
-          // FIX: capture received byte directly into the seq_item
-          receive_byte(req_item.data[i]);
-          if (i < req_item.data.size() - 1) begin
-            send_ack();
-          end else begin
-            send_nack();
-          end
-        end
-      end
-
-      if (req_item.stop_cond) begin
-        send_stop();
-      end
-
-      // FIX: Broadcast expected transaction AFTER completion with updated data
       req_analysis_port.write(req_item);
 
       seq_item_port.item_done();
     end
   endtask
 
-  //-------------------------------------------------------------------------
-  // Task: Send START condition
-  //-------------------------------------------------------------------------
+  virtual task drive_item(i2c_seq_item it);
+    bit         got_ack;
+    logic [7:0] rdata;
+
+    if (it.start_cond && !it.rep_start) begin
+      send_start();
+    end else if (it.rep_start) begin
+      send_rep_start();
+    end
+
+    if (it.start_cond || it.rep_start) begin
+      send_byte({it.addr, logic'(it.dir)});
+      wait_for_ack(got_ack);
+      it.addr_ack     = got_ack;
+      it.ack_received = got_ack;
+      if (!got_ack) begin
+        `uvm_info(get_type_name(),
+                  $sformatf("Address 0x%02x NACKed — aborting with STOP", it.addr), UVM_MEDIUM)
+        it.data.delete();
+        it.num_data = 0;
+        send_stop();
+        return;
+      end
+    end
+
+    if (it.dir == DIR_WRITE) begin
+      for (int i = 0; i < it.data.size(); i++) begin
+        send_byte(it.data[i]);
+        wait_for_ack(got_ack);
+        it.byte_ack.push_back(got_ack);
+        if (!got_ack) begin
+          `uvm_info(get_type_name(),
+                    $sformatf("Data byte %0d NACKed — ending transfer", i), UVM_MEDIUM)
+          it.data     = it.data[0:i];
+          it.num_data = i + 1;
+          break;
+        end
+      end
+    end else begin
+      for (int i = 0; i < it.data.size(); i++) begin
+        receive_byte(rdata);
+        it.data[i] = rdata;
+        if (i < it.data.size() - 1) send_ack();
+        else                        send_nack();
+      end
+    end
+
+    if (it.stop_cond) begin
+      send_stop();
+    end
+  endtask
+
+  virtual task scl_release_wait();
+    int timeout_count = 0;
+    vif.scl_drv <= 1'b1;
+    @(posedge vif.clk);
+    while (vif.scl !== 1'b1) begin
+      @(posedge vif.clk);
+      timeout_count++;
+      if (timeout_count >= MAX_CLK_STRETCH) begin
+        `uvm_error(get_type_name(),
+                   $sformatf("Clock-stretch timeout: SCL held low > %0d cycles", MAX_CLK_STRETCH))
+        return;
+      end
+    end
+  endtask
+
   virtual task send_start();
     `uvm_info(get_type_name(), "Sending START condition", UVM_HIGH)
     vif.sda_drv <= 1'b1;
     vif.scl_drv <= 1'b1;
-    @(posedge vif.clk); @(posedge vif.clk);
+    repeat (T_SU_STA) @(posedge vif.clk);
     vif.sda_drv <= 1'b0;  // SDA falls while SCL HIGH = START
-    @(posedge vif.clk); @(posedge vif.clk);
+    repeat (T_HD_STA) @(posedge vif.clk);
     vif.scl_drv <= 1'b0;
     @(posedge vif.clk);
   endtask
 
-  //-------------------------------------------------------------------------
-  // Task: Send Repeated START (Sr)
-  //-------------------------------------------------------------------------
   virtual task send_rep_start();
     `uvm_info(get_type_name(), "Sending Repeated START (Sr)", UVM_HIGH)
-    vif.sda_drv <= 1'b1;
-    @(posedge vif.clk); @(posedge vif.clk);
-    vif.scl_drv <= 1'b1;
-    @(posedge vif.clk); @(posedge vif.clk);
-    vif.sda_drv <= 1'b0;  // SDA falls while SCL HIGH = Repeated START
-    @(posedge vif.clk); @(posedge vif.clk);
+    vif.scl_drv <= 1'b0;
+    repeat (BIT_HOLD) @(posedge vif.clk);
+    vif.sda_drv <= 1'b1;             // release SDA while SCL low
+    repeat (BIT_SETUP) @(posedge vif.clk);
+    scl_release_wait();              // SCL high (stretch-aware), SDA high
+    repeat (T_SU_STA) @(posedge vif.clk);
+    vif.sda_drv <= 1'b0;             // SDA falls while SCL HIGH = Sr
+    repeat (T_HD_STA) @(posedge vif.clk);
     vif.scl_drv <= 1'b0;
     @(posedge vif.clk);
   endtask
 
-  //-------------------------------------------------------------------------
-  // Task: Send STOP condition
-  //-------------------------------------------------------------------------
   virtual task send_stop();
     `uvm_info(get_type_name(), "Sending STOP condition", UVM_HIGH)
-    vif.sda_drv <= 1'b0;
     vif.scl_drv <= 1'b0;
-    @(posedge vif.clk); @(posedge vif.clk);
-    vif.scl_drv <= 1'b1;  // SCL rises first
-    @(posedge vif.clk); @(posedge vif.clk);
-    vif.sda_drv <= 1'b1;  // SDA rises while SCL HIGH = STOP
-    @(posedge vif.clk); @(posedge vif.clk);
+    repeat (BIT_HOLD) @(posedge vif.clk);
+    vif.sda_drv <= 1'b0;             // SDA low while SCL low (setup)
+    repeat (BIT_SETUP) @(posedge vif.clk);
+    scl_release_wait();              // SCL high first...
+    repeat (T_SU_STO) @(posedge vif.clk);
+    vif.sda_drv <= 1'b1;             // ...then SDA rises while SCL HIGH = STOP
+    repeat (BUS_FREE_N) @(posedge vif.clk);  // T_BUF bus-free time (A7)
   endtask
 
-  //-------------------------------------------------------------------------
-  // Task: Send a single byte (MSB first)
-  //-------------------------------------------------------------------------
   virtual task send_byte(input logic [7:0] byte_data);
     `uvm_info(get_type_name(), $sformatf("Sending byte: 0x%02x", byte_data), UVM_HIGH)
     for (int i = 7; i >= 0; i--) begin
       vif.scl_drv <= 1'b0;
+      repeat (BIT_HOLD) @(posedge vif.clk);    // T_HD_DAT: hold SDA after SCL fall
       vif.sda_drv <= byte_data[i];
-      @(posedge vif.clk);
-      @(posedge vif.clk);
-      vif.scl_drv <= 1'b1;  // SCL HIGH — slave samples SDA
-      @(posedge vif.clk);
-      @(posedge vif.clk);
-      vif.scl_drv <= 1'b0;
-      @(posedge vif.clk);
+      repeat (BIT_SETUP) @(posedge vif.clk);   // T_SU_DAT: setup before SCL rise
+      scl_release_wait();                      // SCL HIGH — slave samples SDA
+      repeat (SCL_HIGH_N) @(posedge vif.clk);
     end
   endtask
 
-  //-------------------------------------------------------------------------
-  // Task: Receive a single byte (MSB first)
-  // FIX: Takes output ref to write received data back into the seq_item
-  //-------------------------------------------------------------------------
   virtual task receive_byte(output logic [7:0] received_byte);
     `uvm_info(get_type_name(), "Receiving byte from slave", UVM_HIGH)
     for (int i = 7; i >= 0; i--) begin
       vif.scl_drv <= 1'b0;
-      vif.sda_drv <= 1'b1;          // Release SDA (let slave drive)
-      @(posedge vif.clk);
-      @(posedge vif.clk);
-      vif.scl_drv <= 1'b1;          // SCL HIGH — sample SDA
-      @(posedge vif.clk);
-      received_byte[i] = vif.sda;   // Sample on SCL HIGH
-      @(posedge vif.clk);
-      vif.scl_drv <= 1'b0;
-      @(posedge vif.clk);
+      repeat (BIT_HOLD) @(posedge vif.clk);
+      vif.sda_drv <= 1'b1;                     // Release SDA (let slave drive)
+      repeat (BIT_SETUP) @(posedge vif.clk);
+      scl_release_wait();                      // SCL HIGH — sample window
+      repeat (2) @(posedge vif.clk);
+      received_byte[i] = vif.sda;              // Sample mid-high
+      repeat (SCL_HIGH_N - 2) @(posedge vif.clk);
     end
     `uvm_info(get_type_name(), $sformatf("Received byte: 0x%02x", received_byte), UVM_MEDIUM)
   endtask
 
-  //-------------------------------------------------------------------------
-  // Task: Wait for ACK/NACK (9th clock cycle)
-  //-------------------------------------------------------------------------
-  virtual task wait_for_ack();
-    bit sampled_ack;
+  virtual task wait_for_ack(output bit ack_result);
     `uvm_info(get_type_name(), "Waiting for ACK/NACK", UVM_HIGH)
     vif.scl_drv <= 1'b0;
-    vif.sda_drv <= 1'b1;          // Release SDA (let slave drive ACK)
-    @(posedge vif.clk);
-    @(posedge vif.clk);
-    vif.scl_drv <= 1'b1;          // SCL HIGH — sample ACK
-    @(posedge vif.clk);
-    sampled_ack = vif.sda;
-    @(posedge vif.clk);
-    vif.scl_drv <= 1'b0;
-    @(posedge vif.clk);
+    repeat (BIT_HOLD) @(posedge vif.clk);
+    vif.sda_drv <= 1'b1;                       // Release SDA (slave drives ACK)
+    repeat (BIT_SETUP) @(posedge vif.clk);
+    scl_release_wait();                        // SCL HIGH — sample ACK
+    repeat (2) @(posedge vif.clk);
+    ack_result = (vif.sda === 1'b0);
+    repeat (SCL_HIGH_N - 2) @(posedge vif.clk);
 
-    if (sampled_ack === 1'b0) begin
-      `uvm_info(get_type_name(), "ACK received", UVM_MEDIUM)
-    end else begin
-      `uvm_warning(get_type_name(), "NACK received!")
-    end
+    if (ack_result) `uvm_info(get_type_name(), "ACK received", UVM_MEDIUM)
+    else            `uvm_info(get_type_name(), "NACK received", UVM_MEDIUM)
   endtask
 
-  //-------------------------------------------------------------------------
-  // Task: Send ACK (after receiving a byte from slave)
-  //-------------------------------------------------------------------------
   virtual task send_ack();
     `uvm_info(get_type_name(), "Sending ACK", UVM_HIGH)
-    vif.scl_drv <= 1'b0;
-    vif.sda_drv <= 1'b0;          // Drive LOW for ACK
-    @(posedge vif.clk);
-    @(posedge vif.clk);
-    vif.scl_drv <= 1'b1;
-    @(posedge vif.clk);
-    @(posedge vif.clk);
-    vif.scl_drv <= 1'b0;
-    @(posedge vif.clk);
-    vif.sda_drv <= 1'b1;          // Release
-    @(posedge vif.clk);
+    drive_ack_bit(1'b0);
   endtask
 
-  //-------------------------------------------------------------------------
-  // Task: Send NACK (after receiving last byte from slave)
-  //-------------------------------------------------------------------------
   virtual task send_nack();
     `uvm_info(get_type_name(), "Sending NACK", UVM_HIGH)
+    drive_ack_bit(1'b1);
+  endtask
+
+  virtual task drive_ack_bit(input logic level);
     vif.scl_drv <= 1'b0;
-    vif.sda_drv <= 1'b1;          // Keep HIGH for NACK (release)
-    @(posedge vif.clk);
-    @(posedge vif.clk);
-    vif.scl_drv <= 1'b1;
-    @(posedge vif.clk);
-    @(posedge vif.clk);
+    repeat (BIT_HOLD) @(posedge vif.clk);
+    vif.sda_drv <= level;                      // 0 = ACK, 1 = NACK (release)
+    repeat (BIT_SETUP) @(posedge vif.clk);
+    scl_release_wait();
+    repeat (SCL_HIGH_N) @(posedge vif.clk);
     vif.scl_drv <= 1'b0;
+    repeat (BIT_HOLD) @(posedge vif.clk);
+    vif.sda_drv <= 1'b1;                       // Release SDA during SCL low
     @(posedge vif.clk);
   endtask
 
 endclass : i2c_driver
 
 `endif
-
-//=============================================================================
-// File          : i2c_slave_monitor.sv
-// Description   : UVM Monitor for I2C Slave DUT status signals
-//               : Observes addr_match, active, rx_data_valid, etc. and
-//               : creates slave_status transactions for analysis.
-// Language      : SystemVerilog (IEEE 1800-2012) + UVM 1.2
-//=============================================================================
 
 `ifndef I2C_SLAVE_MONITOR_SV
 `define I2C_SLAVE_MONITOR_SV
@@ -790,14 +794,6 @@ endclass : i2c_slave_monitor
 
 `endif
 
-//=============================================================================
-// File          : i2c_slave_driver.sv
-// Description   : UVM Driver for I2C Slave Control
-//               : Reactively controls stretch_en, stretch_cycles,
-//               : and force_data_nack based on sequence items.
-// Language      : SystemVerilog (IEEE 1800-2012) + UVM 1.2
-//=============================================================================
-
 `ifndef I2C_SLAVE_DRIVER_SV
 `define I2C_SLAVE_DRIVER_SV
 
@@ -838,12 +834,8 @@ class i2c_slave_driver extends uvm_driver #(i2c_slave_ctrl_item);
 
   virtual i2c_slave_if vif;
 
-  // T13: Optional bus-level interface handle used when this driver acts as
-  // a "competing master" to provoke arbitration loss. Only fetched when
-  // compete_mode is set by the test via config_db; otherwise unused.
   virtual i2c_if       bus_vif;
 
-  // T13: Competing-master mode controls (set by test via config_db)
   bit  compete_mode    = 1'b0;
   int  compete_at_bit  = 3;
 
@@ -856,7 +848,6 @@ class i2c_slave_driver extends uvm_driver #(i2c_slave_ctrl_item);
     if (!uvm_config_db#(virtual i2c_slave_if)::get(this, "", "i2c_slave_vif", vif)) begin
       `uvm_fatal(get_type_name(), "i2c_slave_vif not found in config_db")
     end
-    // T13: Pull competing-master config (optional — defaults disable feature)
     void'(uvm_config_db#(bit)::get(this, "", "compete_mode",   compete_mode));
     void'(uvm_config_db#(int)::get(this, "", "compete_at_bit", compete_at_bit));
     if (compete_mode) begin
@@ -875,9 +866,6 @@ class i2c_slave_driver extends uvm_driver #(i2c_slave_ctrl_item);
     vif.stretch_cycles  <= 16'd0;
     vif.force_data_nack <= 1'b0;
 
-    // T13: Spawn competing-master driver as a background process when enabled.
-    // It runs concurrently with the normal slave-control behavior so existing
-    // sequences (stretch, force_nack) are unaffected.
     if (compete_mode) begin
       fork
         drive_competition();
@@ -892,9 +880,6 @@ class i2c_slave_driver extends uvm_driver #(i2c_slave_ctrl_item);
       vif.stretch_cycles  <= req.stretch_cycles;
       vif.force_data_nack <= req.force_data_nack;
 
-      // FIX: Wait for slave to become active FIRST, then wait for transaction to complete.
-      // Original bug: wait(active===0) passed immediately if slave wasn't yet active,
-      // causing control signals to be cleared before the master even started.
       if (req.stretch_en) begin
         wait (vif.active === 1'b1);  // FIX: Wait for transaction to START
         wait (vif.active === 1'b0);  // Then wait for transaction to END
@@ -912,35 +897,21 @@ class i2c_slave_driver extends uvm_driver #(i2c_slave_ctrl_item);
     end
   endtask
 
-  //---------------------------------------------------------------------------
-  // T13: Competing-master driver task
-  // Waits for the master under test to issue START, then counts SCL pulses
-  // until reaching `compete_at_bit`. At that point, pulls SDA low for one
-  // SCL high window, which collides with the master's transmitted bit.
-  // If the master is driving SDA HIGH at that moment, it sees sda_i=0 and
-  // detects arbitration loss.
-  //---------------------------------------------------------------------------
   virtual task drive_competition();
     `uvm_info(get_type_name(), "T13: competing master task started", UVM_MEDIUM)
-    // Ensure released to start
     bus_vif.sda_drv_x <= 1'b1;
 
-    // Wait for START condition: SDA falls while SCL is HIGH
     @(negedge bus_vif.sda);
     if (bus_vif.scl !== 1'b1) begin
-      // Not a real START — wait again
       wait (bus_vif.sda === 1'b1 && bus_vif.scl === 1'b1);
       @(negedge bus_vif.sda);
     end
     `uvm_info(get_type_name(), "T13: detected START — counting SCL bits", UVM_MEDIUM)
 
-    // Skip past addr byte + 1 ACK bit (8+1 = 9 SCL cycles already counted
-    // implicitly via compete_at_bit). We count rising edges of SCL.
     for (int i = 0; i < compete_at_bit; i++) begin
       @(posedge bus_vif.scl);
     end
 
-    // At the chosen bit position: drive SDA LOW during the next SCL HIGH
     @(negedge bus_vif.scl);             // wait for SCL to go LOW (bit change)
     bus_vif.sda_drv_x <= 1'b0;          // pull SDA LOW (compete)
     `uvm_info(get_type_name(),
@@ -956,14 +927,6 @@ endclass : i2c_slave_driver
 
 `endif
 
-//=============================================================================
-// File          : i2c_sequences.sv
-// Description   : Reusable UVM Sequence Library for I2C Verification
-//               : V2: Fixed rep_start, added clock_stretch, data_nack,
-//               : bus_free sequences.
-// Language      : SystemVerilog (IEEE 1800-2012) + UVM 1.2
-//=============================================================================
-
 `ifndef I2C_SEQUENCES_SV
 `define I2C_SEQUENCES_SV
 
@@ -975,16 +938,42 @@ class i2c_base_seq extends uvm_sequence #(i2c_seq_item);
     super.new(name);
   endfunction
 
+  task do_rep_chain(string prefix);
+    i2c_seq_item seg_a, seg_b;
+
+    seg_a = i2c_seq_item::type_id::create({prefix, "_chainA"});
+    seg_a.default_trans_c.constraint_mode(0);
+    start_item(seg_a);
+    if (!seg_a.randomize() with {
+      addr       == 7'h50;
+      num_data inside {[1:4]};
+      start_cond == 1;
+      stop_cond  == 0;
+      rep_start  == 0;
+    }) `uvm_fatal("SEQ", "Randomization failed for rep-chain segment A")
+    finish_item(seg_a);
+
+    seg_b = i2c_seq_item::type_id::create({prefix, "_chainB"});
+    seg_b.default_trans_c.constraint_mode(0);
+    start_item(seg_b);
+    if (!seg_b.randomize() with {
+      addr       == 7'h50;
+      num_data inside {[1:4]};
+      start_cond == 0;
+      stop_cond  == 1;
+      rep_start  == 1;
+    }) `uvm_fatal("SEQ", "Randomization failed for rep-chain segment B")
+    finish_item(seg_b);
+  endtask
+
 endclass : i2c_base_seq
 
 class i2c_single_write_seq extends i2c_base_seq;
 
   `uvm_object_utils(i2c_single_write_seq)
 
-  rand logic [6:0] addr;
-  rand logic [7:0] data;
-
-  constraint default_addr_c { addr == 7'h50; }
+  logic [6:0] addr = 7'h50;
+  logic [7:0] data = 8'hA5;
 
   function new(string name = "i2c_single_write_seq");
     super.new(name);
@@ -1011,9 +1000,7 @@ class i2c_single_read_seq extends i2c_base_seq;
 
   `uvm_object_utils(i2c_single_read_seq)
 
-  rand logic [6:0] addr;
-
-  constraint default_addr_c { addr == 7'h50; }
+  logic [6:0] addr = 7'h50;
 
   function new(string name = "i2c_single_read_seq");
     super.new(name);
@@ -1154,6 +1141,7 @@ class i2c_rep_start_seq extends i2c_base_seq;
     i2c_seq_item wr_item, rd_item;
 
     wr_item = i2c_seq_item::type_id::create("wr_item");
+    wr_item.default_trans_c.constraint_mode(0);
     start_item(wr_item);
     if (!wr_item.randomize() with {
       addr       == local::addr;
@@ -1167,6 +1155,7 @@ class i2c_rep_start_seq extends i2c_base_seq;
     finish_item(wr_item);
 
     rd_item = i2c_seq_item::type_id::create("rd_item");
+    rd_item.default_trans_c.constraint_mode(0);
     start_item(rd_item);
     if (!rd_item.randomize() with {
       addr       == local::addr;
@@ -1215,10 +1204,8 @@ class i2c_clock_stretch_seq extends i2c_base_seq;
 
   rand logic [6:0]  addr;
   rand logic [7:0]  data;
-  rand logic [15:0] stretch_cycles;
 
   constraint default_addr_c  { addr == 7'h50; }
-  constraint stretch_cycles_c { stretch_cycles inside {[16'd50 : 16'd200]}; }
 
   function new(string name = "i2c_clock_stretch_seq");
     super.new(name);
@@ -1315,13 +1302,17 @@ class i2c_random_seq extends i2c_base_seq;
 
   task body();
     for (int i = 0; i < num_txns; i++) begin
-      i2c_seq_item item = i2c_seq_item::type_id::create($sformatf("rand_item_%0d", i));
-      start_item(item);
-      if (!item.randomize()) begin
-        `uvm_error("SEQ", $sformatf("Randomization failed for item %0d", i))
-        continue;
+      if ($urandom_range(0, 3) == 0) begin
+        do_rep_chain($sformatf("rand_%0d", i));
+      end else begin
+        i2c_seq_item item = i2c_seq_item::type_id::create($sformatf("rand_item_%0d", i));
+        start_item(item);
+        if (!item.randomize()) begin
+          `uvm_error("SEQ", $sformatf("Randomization failed for item %0d", i))
+          continue;
+        end
+        finish_item(item);
       end
-      finish_item(item);
     end
   endtask
 
@@ -1339,13 +1330,17 @@ class i2c_stress_seq extends i2c_base_seq;
 
   task body();
     for (int i = 0; i < num_txns; i++) begin
-      i2c_seq_item item = i2c_seq_item::type_id::create($sformatf("stress_item_%0d", i));
-      start_item(item);
-      if (!item.randomize()) begin
-        `uvm_error("SEQ", $sformatf("Randomization failed for stress item %0d", i))
-        continue;
+      if ($urandom_range(0, 3) == 0) begin
+        do_rep_chain($sformatf("stress_%0d", i));
+      end else begin
+        i2c_seq_item item = i2c_seq_item::type_id::create($sformatf("stress_item_%0d", i));
+        start_item(item);
+        if (!item.randomize()) begin
+          `uvm_error("SEQ", $sformatf("Randomization failed for stress item %0d", i))
+          continue;
+        end
+        finish_item(item);
       end
-      finish_item(item);
     end
   endtask
 
@@ -1443,6 +1438,7 @@ class i2c_slave_force_nack_seq extends uvm_sequence #(i2c_slave_ctrl_item);
     i2c_slave_ctrl_item ctrl = i2c_slave_ctrl_item::type_id::create("ctrl");
     start_item(ctrl);
     ctrl.force_nack_off_c.constraint_mode(0);
+    ctrl.stretch_cycles_c.constraint_mode(0);
     if (!ctrl.randomize() with {
       stretch_en      == 1'b0;
       stretch_cycles  == 16'd0;
@@ -1460,7 +1456,7 @@ class i2c_slave_stretch_ctrl_seq extends uvm_sequence #(i2c_slave_ctrl_item);
   rand logic [15:0] stretch_cycles;
 
   constraint stretch_cycles_c {
-    stretch_cycles inside {[16'd50 : 16'd200]};
+    stretch_cycles inside {[16'd200 : 16'd400]};
   }
 
   function new(string name = "i2c_slave_stretch_ctrl_seq");
@@ -1510,13 +1506,6 @@ class i2c_sequential_seq extends i2c_base_seq;
 
 endclass : i2c_sequential_seq
 
-//=============================================================================
-// T13: arb_lost_sequence
-// Drives a write transaction whose data byte (0xAA) WILL collide with the
-// competing master pulled low by the slave driver in compete_mode. The
-// master under test should detect arb_lost during STATE_TX_BIT and abort
-// the transaction cleanly without producing a STOP.
-//=============================================================================
 class arb_lost_sequence extends uvm_sequence #(i2c_seq_item);
 
   `uvm_object_utils(arb_lost_sequence)
@@ -1543,23 +1532,6 @@ class arb_lost_sequence extends uvm_sequence #(i2c_seq_item);
 
 endclass : arb_lost_sequence
 
-//=============================================================================
-// T14: deep_rep_start_sequence
-// Sends a 4-segment repeated-START chain to close CG11 (i2c_rep_depth_cg):
-//   seg0: fresh START, write, no STOP  → chain_depth=0  (no_rep  bin)
-//   seg1: REP_START,   write, no STOP  → chain_depth=1  (one_rep  bin)
-//   seg2: REP_START,   write, no STOP  → chain_depth=2  (two_rep  bin)
-//   seg3: REP_START,   read,  STOP     → chain_depth=3  (deep_rep bin)
-//
-// All 4 depth bins are exercised in a single test run.
-// Also exercises CG14 (RepStart x Dir) with write→write→write→read pattern,
-// and CG16 (Protocol x Dir) with no_stop+write and has_stop+read cells.
-//
-// Why default_trans_c is disabled: that constraint hard-codes start_cond=1,
-// stop_cond=1, rep_start=0 for every item. Middle segments need stop_cond=0
-// and final segments need rep_start=1, so we turn it off per-item and
-// specify protocol fields explicitly via inline constraints.
-//=============================================================================
 class deep_rep_start_sequence extends i2c_base_seq;
 
   `uvm_object_utils(deep_rep_start_sequence)
@@ -1573,7 +1545,6 @@ class deep_rep_start_sequence extends i2c_base_seq;
   task body();
     i2c_seq_item seg0, seg1, seg2, seg3;
 
-    // --- Segment 0: fresh START, write, no STOP — begins the rep-start chain ---
     seg0 = i2c_seq_item::type_id::create("seg0");
     seg0.default_trans_c.constraint_mode(0);
     start_item(seg0);
@@ -1587,7 +1558,6 @@ class deep_rep_start_sequence extends i2c_base_seq;
     }) `uvm_fatal("SEQ", "deep_rep_start_sequence: seg0 randomization failed")
     finish_item(seg0);
 
-    // --- Segment 1: REP_START, write, no STOP — chain_depth=1 ---
     seg1 = i2c_seq_item::type_id::create("seg1");
     seg1.default_trans_c.constraint_mode(0);
     start_item(seg1);
@@ -1601,7 +1571,6 @@ class deep_rep_start_sequence extends i2c_base_seq;
     }) `uvm_fatal("SEQ", "deep_rep_start_sequence: seg1 randomization failed")
     finish_item(seg1);
 
-    // --- Segment 2: REP_START, write, no STOP — chain_depth=2 ---
     seg2 = i2c_seq_item::type_id::create("seg2");
     seg2.default_trans_c.constraint_mode(0);
     start_item(seg2);
@@ -1615,7 +1584,6 @@ class deep_rep_start_sequence extends i2c_base_seq;
     }) `uvm_fatal("SEQ", "deep_rep_start_sequence: seg2 randomization failed")
     finish_item(seg2);
 
-    // --- Segment 3: REP_START, read, STOP — chain_depth=3 — end of chain ---
     seg3 = i2c_seq_item::type_id::create("seg3");
     seg3.default_trans_c.constraint_mode(0);
     start_item(seg3);
@@ -1634,13 +1602,6 @@ endclass : deep_rep_start_sequence
 
 `endif
 
-//=============================================================================
-// File          : i2c_coverage.sv
-// Description   : UVM Functional Coverage Collector for I2C Verification
-//               : V3: 8 covergroups for comprehensive coverage
-// Language      : SystemVerilog (IEEE 1800-2012) + UVM 1.2
-//=============================================================================
-
 `ifndef I2C_COVERAGE_SV
 `define I2C_COVERAGE_SV
 
@@ -1650,7 +1611,6 @@ class i2c_coverage extends uvm_subscriber #(i2c_seq_item);
   i2c_seq_item item;
   bit has_data_nack;  // computed in write() from byte_ack[] queue
 
-  // 1. Transaction Direction
   covergroup i2c_dir_cg;
     option.per_instance = 1;
     option.name = "Direction";
@@ -1660,7 +1620,6 @@ class i2c_coverage extends uvm_subscriber #(i2c_seq_item);
     }
   endgroup
 
-  // 2. Data Size (Burst lengths)
   covergroup i2c_data_size_cg;
     option.per_instance = 1;
     option.name = "Data Size";
@@ -1672,7 +1631,6 @@ class i2c_coverage extends uvm_subscriber #(i2c_seq_item);
     }
   endgroup
 
-  // 3. Address Types
   covergroup i2c_addr_cg;
     option.per_instance = 1;
     option.name = "Address";
@@ -1682,7 +1640,6 @@ class i2c_coverage extends uvm_subscriber #(i2c_seq_item);
     }
   endgroup
 
-  // 4. Protocol Conditions
   covergroup i2c_protocol_cg;
     option.per_instance = 1;
     option.name = "Protocol";
@@ -1694,7 +1651,6 @@ class i2c_coverage extends uvm_subscriber #(i2c_seq_item);
     cp_rep:   coverpoint item.rep_start  { bins has_rep   = {1}; bins no_rep  = {0}; }
   endgroup
 
-  // 5. ACK/NACK Tracking
   covergroup i2c_ack_cg;
     option.per_instance = 1;
     option.name = "ACK Responses";
@@ -1704,7 +1660,6 @@ class i2c_coverage extends uvm_subscriber #(i2c_seq_item);
     }
   endgroup
 
-  // 6. Cross Coverage: Direction x Size
   covergroup i2c_burst_cg;
     option.per_instance = 1;
     option.name = "Burst Cross";
@@ -1718,11 +1673,6 @@ class i2c_coverage extends uvm_subscriber #(i2c_seq_item);
     cross cp_dir, cp_size;
   endgroup
 
-  // 7. Register Bank Coverage — how many registers are touched per transaction.
-  // FIX BUG #13: Previous version covered item.data[0] value (0-255 data ranges)
-  // mislabeled as "Register Access". Since reg_ptr is internal to DUT and not
-  // exposed in seq_item, we cover burst length (num_data) for write transactions,
-  // which determines how many register slots are written starting from ptr=0.
   covergroup i2c_reg_ptr_cg;
     option.per_instance = 1;
     option.name = "Register Bank Coverage";
@@ -1735,7 +1685,6 @@ class i2c_coverage extends uvm_subscriber #(i2c_seq_item);
     }
   endgroup
 
-  // 8. Cross Coverage: Target Address x Direction
   covergroup i2c_target_cg;
     option.per_instance = 1;
     option.name = "Target Cross";
@@ -1744,8 +1693,6 @@ class i2c_coverage extends uvm_subscriber #(i2c_seq_item);
     cross cp_addr, cp_dir;
   endgroup
 
-  // 9. Per-Byte ACK/NACK Tracking
-  // Closes hole: byte_ack[] existed in seq_item but was never measured in coverage
   covergroup i2c_byte_nack_cg;
     option.per_instance = 1;
     option.name = "Per-Byte NACK";
@@ -1755,8 +1702,6 @@ class i2c_coverage extends uvm_subscriber #(i2c_seq_item);
     }
   endgroup
 
-  // 10. Clock Stretch Coverage
-  // Closes hole: clock_stretch_test exercised stretch but coverage never measured it
   covergroup i2c_stretch_cg;
     option.per_instance = 1;
     option.name = "Clock Stretch";
@@ -1766,8 +1711,6 @@ class i2c_coverage extends uvm_subscriber #(i2c_seq_item);
     }
   endgroup
 
-  // 11. Repeated START Chain Depth
-  // Closes hole: rep_start was yes/no; now measures HOW DEEP the chain goes
   covergroup i2c_rep_depth_cg;
     option.per_instance = 1;
     option.name = "RepStart Depth";
@@ -1779,8 +1722,6 @@ class i2c_coverage extends uvm_subscriber #(i2c_seq_item);
     }
   endgroup
 
-  // 12. Cross: Direction x Address Range
-  // Catches: reads only tested on target addr, writes on all addresses?
   covergroup i2c_dir_addr_cross_cg;
     option.per_instance = 1;
     option.name = "Dir x Addr Range";
@@ -1793,8 +1734,6 @@ class i2c_coverage extends uvm_subscriber #(i2c_seq_item);
     cross cp_dir, cp_addr_range;
   endgroup
 
-  // 13. Cross: Direction x ACK Result
-  // Catches: all 4 combos needed — write+ack, write+nack, read+ack, read+nack
   covergroup i2c_dir_ack_cross_cg;
     option.per_instance = 1;
     option.name = "Dir x ACK";
@@ -1806,8 +1745,6 @@ class i2c_coverage extends uvm_subscriber #(i2c_seq_item);
     cross cp_dir, cp_ack;
   endgroup
 
-  // 14. Cross: Repeated START x Direction
-  // Catches: rep_start for write->write, write->read, read->write, read->read
   covergroup i2c_rep_dir_cross_cg;
     option.per_instance = 1;
     option.name = "RepStart x Dir";
@@ -1819,24 +1756,20 @@ class i2c_coverage extends uvm_subscriber #(i2c_seq_item);
     cross cp_rep, cp_dir;
   endgroup
 
-  // 15. Cross: Direction x Data Size (Refined)
-  // Catches: burst reads of 17-32 bytes never tested? read+xlarge gap?
   covergroup i2c_dir_size_cross_cg;
     option.per_instance = 1;
     option.name = "Dir x Data Size";
     cp_dir: coverpoint item.dir;
     cp_size: coverpoint item.num_data {
-      bins single  = {1};
-      bins small   = {[2:4]};
-      bins medium  = {[5:8]};
-      bins large   = {[9:16]};
-      bins xlarge  = {[17:32]};
+      bins single    = {1};
+      bins sz_small  = {[2:4]};
+      bins sz_medium = {[5:8]};
+      bins sz_large  = {[9:16]};
+      bins sz_xlarge = {[17:32]};
     }
     cross cp_dir, cp_size;
   endgroup
 
-  // 16. Cross: Protocol Flags x Direction
-  // Catches: is STOP always present? rep_start in both read and write directions?
   covergroup i2c_protocol_dir_cross_cg;
     option.per_instance = 1;
     option.name = "Protocol x Dir";
@@ -1848,10 +1781,6 @@ class i2c_coverage extends uvm_subscriber #(i2c_seq_item);
     cross cp_dir, cp_has_stop;
   endgroup
 
-  // 17. Cross Coverage: Clock Stretch x Direction
-  // Catches: clock stretch exercised in BOTH read and write directions?
-  // clock_stretch_test only drives writes — stretch+read is an untested corner.
-  // A slave holding SCL low during a READ is equally valid and must be verified.
   covergroup i2c_stretch_dir_cross_cg;
     option.per_instance = 1;
     option.name = "Stretch x Dir";
@@ -1886,10 +1815,8 @@ class i2c_coverage extends uvm_subscriber #(i2c_seq_item);
 
   virtual function void write(i2c_seq_item t);
     this.item = t;
-    // Compute derived coverage flag from per-byte ACK queue
     has_data_nack = 0;
     foreach (t.byte_ack[i]) if (t.byte_ack[i] == 1'b0) has_data_nack = 1;
-    // Sample all covergroups
     i2c_dir_cg.sample();
     i2c_data_size_cg.sample();
     i2c_addr_cg.sample();
@@ -1898,7 +1825,6 @@ class i2c_coverage extends uvm_subscriber #(i2c_seq_item);
     i2c_burst_cg.sample();
     if (t.num_data > 0) i2c_reg_ptr_cg.sample();
     if (t.addr == 7'h50) i2c_target_cg.sample();
-    // New covergroups (CG9-CG16)
     if (t.num_data > 0) i2c_byte_nack_cg.sample();
     i2c_stretch_cg.sample();
     i2c_rep_depth_cg.sample();
@@ -1911,16 +1837,35 @@ class i2c_coverage extends uvm_subscriber #(i2c_seq_item);
   endfunction
 
   virtual function void report_phase(uvm_phase phase);
-    real dir_cov   = i2c_dir_cg.get_coverage();
-    real size_cov  = i2c_data_size_cg.get_coverage();
-    real ack_cov   = i2c_ack_cg.get_coverage();
-    real burst_cov = i2c_burst_cg.get_coverage();
-    real avg_cov   = (dir_cov + size_cov + ack_cov + burst_cov) / 4.0;
-    
+    real cov_vals[$];
+    real avg_cov = 0.0;
+
+    cov_vals.push_back(i2c_dir_cg.get_coverage());
+    cov_vals.push_back(i2c_data_size_cg.get_coverage());
+    cov_vals.push_back(i2c_addr_cg.get_coverage());
+    cov_vals.push_back(i2c_protocol_cg.get_coverage());
+    cov_vals.push_back(i2c_ack_cg.get_coverage());
+    cov_vals.push_back(i2c_burst_cg.get_coverage());
+    cov_vals.push_back(i2c_reg_ptr_cg.get_coverage());
+    cov_vals.push_back(i2c_target_cg.get_coverage());
+    cov_vals.push_back(i2c_byte_nack_cg.get_coverage());
+    cov_vals.push_back(i2c_stretch_cg.get_coverage());
+    cov_vals.push_back(i2c_rep_depth_cg.get_coverage());
+    cov_vals.push_back(i2c_dir_addr_cross_cg.get_coverage());
+    cov_vals.push_back(i2c_dir_ack_cross_cg.get_coverage());
+    cov_vals.push_back(i2c_rep_dir_cross_cg.get_coverage());
+    cov_vals.push_back(i2c_dir_size_cross_cg.get_coverage());
+    cov_vals.push_back(i2c_protocol_dir_cross_cg.get_coverage());
+    cov_vals.push_back(i2c_stretch_dir_cross_cg.get_coverage());
+
+    foreach (cov_vals[i]) avg_cov += cov_vals[i];
+    avg_cov = avg_cov / cov_vals.size();
+
     super.report_phase(phase);
-    `uvm_info(get_type_name(), 
-              $sformatf("\n--- COVERAGE SUMMARY ---\nDir: %0.2f%%\nSize: %0.2f%%\nACK: %0.2f%%\nBurst: %0.2f%%\nAVG: %0.2f%%\n------------------------", 
-                        dir_cov, size_cov, ack_cov, burst_cov, avg_cov), UVM_LOW)
+    `uvm_info(get_type_name(),
+              $sformatf("\n--- COVERAGE SUMMARY (all %0d covergroups) ---\nDir: %0.2f%%  Size: %0.2f%%  ACK: %0.2f%%  Burst: %0.2f%%\nAVG (all CGs): %0.2f%%\n------------------------",
+                        cov_vals.size(),
+                        cov_vals[0], cov_vals[1], cov_vals[4], cov_vals[5], avg_cov), UVM_LOW)
     if (avg_cov < 90.0) begin
       `uvm_warning(get_type_name(), $sformatf("Coverage is below 90%%: %0.2f%%", avg_cov))
     end
@@ -1941,13 +1886,6 @@ endclass : i2c_coverage
 
 `endif
 
-//=============================================================================
-// File          : i2c_master_agent.sv
-// Description   : UVM Agent for I2C Master — wraps driver, monitor, sequencer.
-//               : Active agent: drives stimulus AND observes the bus.
-// Language      : SystemVerilog (IEEE 1800-2012) + UVM 1.2
-//=============================================================================
-
 `ifndef I2C_MASTER_AGENT_SV
 `define I2C_MASTER_AGENT_SV
 
@@ -1955,33 +1893,18 @@ class i2c_master_agent extends uvm_agent;
 
   `uvm_component_utils(i2c_master_agent)
 
-  //-------------------------------------------------------------------------
-  // Sub-components
-  //-------------------------------------------------------------------------
   i2c_driver              driver;
   i2c_monitor             monitor;
   uvm_sequencer #(i2c_seq_item) sequencer;
 
-  //-------------------------------------------------------------------------
-  // TLM Analysis Port — broadcasts items observed by the monitor.
-  // The environment connects this to the scoreboard's actual_export.
-  //-------------------------------------------------------------------------
   uvm_analysis_port #(i2c_seq_item) analysis_port;
 
-  //-------------------------------------------------------------------------
-  // Constructor
-  //-------------------------------------------------------------------------
   function new(string name = "i2c_master_agent", uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
-  //-------------------------------------------------------------------------
-  // Build Phase — create sub-components
-  //-------------------------------------------------------------------------
   function void build_phase(uvm_phase phase);
     super.build_phase(phase);
-    // Only instantiate driver and sequencer for ACTIVE agent
-    // (UVM_ACTIVE is the default; pass UVM_PASSIVE to disable driving)
     if (get_is_active() == UVM_ACTIVE) begin
       driver    = i2c_driver::type_id::create("driver",    this);
       sequencer = uvm_sequencer #(i2c_seq_item)::type_id::create("sequencer", this);
@@ -1990,30 +1913,16 @@ class i2c_master_agent extends uvm_agent;
     analysis_port = new("analysis_port", this);
   endfunction
 
-  //-------------------------------------------------------------------------
-  // Connect Phase — wire driver↔sequencer; forward monitor's port
-  //-------------------------------------------------------------------------
   function void connect_phase(uvm_phase phase);
-    // Wire sequencer output to driver input (TLM seq_item_port)
     if (get_is_active() == UVM_ACTIVE) begin
       driver.seq_item_port.connect(sequencer.seq_item_export);
     end
-    // Forward monitor observations to the agent's analysis port
-    // (environment then connects this to scoreboard)
     monitor.item_collected_port.connect(analysis_port);
   endfunction
 
 endclass : i2c_master_agent
 
 `endif
-
-//=============================================================================
-// File          : i2c_slave_agent.sv
-// Description   : UVM Agent for I2C Slave — wraps slave monitor and slave driver.
-//               : Default is PASSIVE (set by env). Tests override via config_db
-//               : with path "*env.slave_agent" before super.build_phase().
-// Language      : SystemVerilog (IEEE 1800-2012) + UVM 1.2
-//=============================================================================
 
 `ifndef I2C_SLAVE_AGENT_SV
 `define I2C_SLAVE_AGENT_SV
@@ -2049,14 +1958,6 @@ endclass : i2c_slave_agent
 
 `endif
 
-//=============================================================================
-// File          : i2c_virtual_sequencer.sv
-// Description   : UVM Virtual Sequencer for I2C Environment.
-//               : Holds handles to the master and slave sequencers for
-//               : coordinated multi-agent sequence execution.
-// Language      : SystemVerilog (IEEE 1800-2012) + UVM 1.2
-//=============================================================================
-
 `ifndef I2C_VIRTUAL_SEQUENCER_SV
 `define I2C_VIRTUAL_SEQUENCER_SV
 
@@ -2064,7 +1965,6 @@ class i2c_virtual_sequencer extends uvm_sequencer;
 
   `uvm_component_utils(i2c_virtual_sequencer)
 
-  // Handles to actual agent sequencers
   uvm_sequencer #(i2c_seq_item)        master_seqr;
   uvm_sequencer #(i2c_slave_ctrl_item) slave_seqr;
 
@@ -2076,19 +1976,9 @@ endclass : i2c_virtual_sequencer
 
 `endif
 
-//=============================================================================
-// File          : i2c_virtual_sequence.sv
-// Description   : UVM Virtual Sequence Library for I2C Environment.
-//               : Coordinates master traffic and slave stretch/NACK behaviors.
-// Language      : SystemVerilog (IEEE 1800-2012) + UVM 1.2
-//=============================================================================
-
 `ifndef I2C_VIRTUAL_SEQUENCE_SV
 `define I2C_VIRTUAL_SEQUENCE_SV
 
-//-----------------------------------------------------------------------------
-// Base Virtual Sequence
-//-----------------------------------------------------------------------------
 class i2c_base_vseq extends uvm_sequence;
 
   `uvm_object_utils(i2c_base_vseq)
@@ -2100,10 +1990,6 @@ class i2c_base_vseq extends uvm_sequence;
 
 endclass : i2c_base_vseq
 
-//-----------------------------------------------------------------------------
-// Clock Stretch Virtual Sequence
-// Coordinates the master sending a write transaction while the slave stretches.
-//-----------------------------------------------------------------------------
 class i2c_stretch_vseq extends i2c_base_vseq;
 
   `uvm_object_utils(i2c_stretch_vseq)
@@ -2112,26 +1998,45 @@ class i2c_stretch_vseq extends i2c_base_vseq;
     super.new(name);
   endfunction
 
+  task arm_stretch(string name);
+    i2c_slave_ctrl_item slave_ctrl;
+    slave_ctrl = i2c_slave_ctrl_item::type_id::create(name);
+    start_item(slave_ctrl, -1, p_sequencer.slave_seqr);
+    slave_ctrl.stretch_en_off_c.constraint_mode(0);
+    if (!slave_ctrl.randomize() with {
+      stretch_en      == 1'b1;
+      stretch_cycles  == 16'd300;
+      force_data_nack == 1'b0;
+    }) `uvm_fatal("VSEQ", "Randomization failed for slave_ctrl")
+    finish_item(slave_ctrl, -1);
+  endtask
+
   task body();
     i2c_single_write_seq master_write;
-    i2c_slave_ctrl_item  slave_ctrl;
+    i2c_single_read_seq  master_read;
 
     `uvm_info(get_type_name(), "Starting i2c_stretch_vseq", UVM_LOW)
 
-    // 1. Configure the slave to stretch the clock
-    slave_ctrl = i2c_slave_ctrl_item::type_id::create("slave_ctrl");
-    start_item(slave_ctrl, -1, p_sequencer.slave_seqr);
-    slave_ctrl.stretch_en_off_c.constraint_mode(0);
-    slave_ctrl.force_nack_off_c.constraint_mode(0);
-    if (!slave_ctrl.randomize() with {
-      stretch_en == 1'b1;
-      stretch_cycles == 16'd50; // Stretch for 50 cycles
-    }) `uvm_fatal("VSEQ", "Randomization failed for slave_ctrl")
-    finish_item(slave_ctrl, -1);
+    if (p_sequencer.slave_seqr == null) begin
+      `uvm_fatal("VSEQ",
+                 "slave_seqr is null — start this vseq with the slave agent UVM_ACTIVE")
+    end
 
-    // 2. Send master traffic
+    fork
+      arm_stretch("stretch_for_write");
+    join_none
+    #200;  // let the ctrl item reach the slave driver before traffic starts
     master_write = i2c_single_write_seq::type_id::create("master_write");
     master_write.start(p_sequencer.master_seqr);
+
+    fork
+      arm_stretch("stretch_for_read");
+    join_none
+    #200;
+    master_read = i2c_single_read_seq::type_id::create("master_read");
+    master_read.start(p_sequencer.master_seqr);
+
+    wait fork;  // drain the ctrl legs
 
     `uvm_info(get_type_name(), "Finished i2c_stretch_vseq", UVM_LOW)
   endtask
@@ -2139,15 +2044,6 @@ class i2c_stretch_vseq extends i2c_base_vseq;
 endclass : i2c_stretch_vseq
 
 `endif
-
-//=============================================================================
-// File          : i2c_env.sv
-// Description   : UVM Environment — top-level UVM container.
-//               : V3: Added virtual sequencer with handle wiring.
-//               : Slave agent defaults to PASSIVE. Tests that need
-//               : it ACTIVE set config_db before super.build_phase().
-// Language      : SystemVerilog (IEEE 1800-2012) + UVM 1.2
-//=============================================================================
 
 `ifndef I2C_ENV_SV
 `define I2C_ENV_SV
@@ -2182,12 +2078,10 @@ class i2c_env extends uvm_env;
   endfunction
 
   function void connect_phase(uvm_phase phase);
-    // Scoreboard connections
     master_agent.monitor.item_collected_port.connect(scoreboard.actual_export);
     master_agent.monitor.item_collected_port.connect(coverage.analysis_export);
     master_agent.driver.req_analysis_port.connect(scoreboard.expected_export);
 
-    // Virtual sequencer handle wiring
     v_sequencer.master_seqr = master_agent.sequencer;
     if (slave_agent.get_is_active() == UVM_ACTIVE) begin
       v_sequencer.slave_seqr = slave_agent.sequencer;
@@ -2197,13 +2091,6 @@ class i2c_env extends uvm_env;
 endclass : i2c_env
 
 `endif
-
-//=============================================================================
-// File          : i2c_base_test.sv
-// Description   : UVM Base Test — uses i2c_write_read_seq from the library.
-//               : V2: Proper pass/fail reporting in report_phase.
-// Language      : SystemVerilog (IEEE 1800-2012) + UVM 1.2
-//=============================================================================
 
 `ifndef I2C_BASE_TEST_SV
 `define I2C_BASE_TEST_SV
@@ -2254,14 +2141,6 @@ class i2c_base_test extends uvm_test;
 endclass : i2c_base_test
 
 `endif
-
-//=============================================================================
-// File          : i2c_tests.sv
-// Description   : Test Plan for I2C Protocol Verification (V2)
-//               : 15 test classes — all are REAL tests with self-checking.
-//               : data_nack_test and clock_stretch_test activate slave agent.
-// Language      : SystemVerilog (IEEE 1800-2012) + UVM 1.2
-//=============================================================================
 
 `ifndef I2C_TESTS_SV
 `define I2C_TESTS_SV
@@ -2447,7 +2326,6 @@ class clock_stretch_test extends i2c_base_test;
     stretch_seq = i2c_clock_stretch_seq::type_id::create("stretch_seq");
     stretch_seq.addr = 7'h50;
     stretch_seq.data = 8'hCC;
-    stretch_seq.stretch_cycles = 16'd100;
     stretch_seq.start(env.master_agent.sequencer);
     #2000;
     `uvm_info(get_type_name(), "clock_stretch_test finished.", UVM_LOW)
@@ -2575,28 +2453,6 @@ class full_stress_test extends i2c_base_test;
   endtask
 endclass : full_stress_test
 
-//=============================================================================
-// T13: Arbitration Lost Test
-// Verifies the master detects arbitration loss when a competing master
-// drives SDA LOW during the master's TX phase. The master under test
-// should abort cleanly (FSM -> IDLE) and assert arb_lost.
-//
-// Mechanism:
-//   - Activates the slave agent and configures its driver in compete_mode.
-//   - The competing-master task (inside the slave driver) waits for the
-//     master to issue START, counts SCL pulses, and at bit position
-//     `compete_at_bit` pulls SDA LOW.
-//   - The master under test is sending data 8'hAA (1010_1010). At certain
-//     bit positions the master will be driving SDA HIGH; the competing
-//     low drive wins (wired-AND), and the master should detect arb_lost.
-//
-// Scoreboard note:
-//   Arbitration loss is an exceptional flow — the master may not complete
-//   the transaction, so this test does NOT assert SCOREBOARD PASSED. It
-//   passes when no UVM_ERROR is observed at the protocol/driver level and
-//   the test exits cleanly. The Makefile pass-detection for this test
-//   should look for "T13: arbitration_lost_test PASS" in the log.
-//=============================================================================
 class arbitration_lost_test extends i2c_base_test;
   `uvm_component_utils(arbitration_lost_test)
 
@@ -2605,14 +2461,14 @@ class arbitration_lost_test extends i2c_base_test;
   endfunction
 
   virtual function void build_phase(uvm_phase phase);
-    // Activate slave agent so the competing-master task runs from its driver.
     uvm_config_db#(uvm_active_passive_enum)::set(this, "env.slave_agent",
                                                   "is_active", UVM_ACTIVE);
-    // T13 compete-mode controls (consumed by i2c_slave_driver.build_phase)
     uvm_config_db#(bit)::set(this, "env.slave_agent.driver",
                               "compete_mode", 1'b1);
     uvm_config_db#(int)::set(this, "env.slave_agent.driver",
                               "compete_at_bit", 3);  // collide at bit 3
+    uvm_config_db#(bit)::set(this, "env.scoreboard",
+                              "allow_bus_corruption", 1'b1);
     super.build_phase(phase);
   endfunction
 
@@ -2634,14 +2490,31 @@ class arbitration_lost_test extends i2c_base_test;
   endtask
 endclass : arbitration_lost_test
 
-//=============================================================================
-// T14: Deep Repeated-START Test
-// Drives a 4-segment rep-start chain: W(no STOP)→W(no STOP)→W(no STOP)→R(STOP)
-// Purpose: close CG11 (i2c_rep_depth_cg) bins two_rep and deep_rep, which
-// are unreachable from rep_start_test (that only creates 1 repeated START).
-// After this test: all 4 depth bins [0,1,2,3] are covered.
-// Also closes: CG16 (write+no_stop cell) and CG14 (rep_start+write cell).
-//=============================================================================
+class stretch_read_test extends i2c_base_test;
+  `uvm_component_utils(stretch_read_test)
+
+  function new(string name = "stretch_read_test", uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    uvm_config_db#(uvm_active_passive_enum)::set(this, "env.slave_agent",
+                                                  "is_active", UVM_ACTIVE);
+    super.build_phase(phase);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    i2c_stretch_vseq vseq;
+    phase.raise_objection(this);
+    `uvm_info(get_type_name(), "Starting stretch_read_test (T15)...", UVM_LOW)
+    vseq = i2c_stretch_vseq::type_id::create("vseq");
+    vseq.start(env.v_sequencer);
+    #2000;
+    `uvm_info(get_type_name(), "stretch_read_test finished.", UVM_LOW)
+    phase.drop_objection(this);
+  endtask
+endclass : stretch_read_test
+
 class deep_rep_start_test extends i2c_base_test;
   `uvm_component_utils(deep_rep_start_test)
 

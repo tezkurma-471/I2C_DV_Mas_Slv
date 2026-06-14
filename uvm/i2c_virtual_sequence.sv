@@ -24,7 +24,14 @@ endclass : i2c_base_vseq
 
 //-----------------------------------------------------------------------------
 // Clock Stretch Virtual Sequence
-// Coordinates the master sending a write transaction while the slave stretches.
+// Coordinates the slave stretching SCL while the master drives a WRITE and
+// then a READ transaction — the read leg closes the has_stretch x DIR_READ
+// cross in i2c_stretch_dir_cross_cg.
+//
+// FIX (post-audit): the old version called finish_item(slave_ctrl) inline.
+// The slave driver only calls item_done() AFTER the bus transaction
+// completes (wait active 1->0), and the master traffic was started after
+// finish_item — a guaranteed deadlock. The ctrl leg now runs in a fork.
 //-----------------------------------------------------------------------------
 class i2c_stretch_vseq extends i2c_base_vseq;
 
@@ -34,26 +41,47 @@ class i2c_stretch_vseq extends i2c_base_vseq;
     super.new(name);
   endfunction
 
+  task arm_stretch(string name);
+    i2c_slave_ctrl_item slave_ctrl;
+    slave_ctrl = i2c_slave_ctrl_item::type_id::create(name);
+    start_item(slave_ctrl, -1, p_sequencer.slave_seqr);
+    slave_ctrl.stretch_en_off_c.constraint_mode(0);
+    if (!slave_ctrl.randomize() with {
+      stretch_en      == 1'b1;
+      stretch_cycles  == 16'd300;
+      force_data_nack == 1'b0;
+    }) `uvm_fatal("VSEQ", "Randomization failed for slave_ctrl")
+    finish_item(slave_ctrl, -1);
+  endtask
+
   task body();
     i2c_single_write_seq master_write;
-    i2c_slave_ctrl_item  slave_ctrl;
+    i2c_single_read_seq  master_read;
 
     `uvm_info(get_type_name(), "Starting i2c_stretch_vseq", UVM_LOW)
 
-    // 1. Configure the slave to stretch the clock
-    slave_ctrl = i2c_slave_ctrl_item::type_id::create("slave_ctrl");
-    start_item(slave_ctrl, -1, p_sequencer.slave_seqr);
-    slave_ctrl.stretch_en_off_c.constraint_mode(0);
-    slave_ctrl.force_nack_off_c.constraint_mode(0);
-    if (!slave_ctrl.randomize() with {
-      stretch_en == 1'b1;
-      stretch_cycles == 16'd50; // Stretch for 50 cycles
-    }) `uvm_fatal("VSEQ", "Randomization failed for slave_ctrl")
-    finish_item(slave_ctrl, -1);
+    if (p_sequencer.slave_seqr == null) begin
+      `uvm_fatal("VSEQ",
+                 "slave_seqr is null — start this vseq with the slave agent UVM_ACTIVE")
+    end
 
-    // 2. Send master traffic
+    // Leg 1: WRITE under stretch
+    fork
+      arm_stretch("stretch_for_write");
+    join_none
+    #200;  // let the ctrl item reach the slave driver before traffic starts
     master_write = i2c_single_write_seq::type_id::create("master_write");
     master_write.start(p_sequencer.master_seqr);
+
+    // Leg 2: READ under stretch (covers stretch x DIR_READ)
+    fork
+      arm_stretch("stretch_for_read");
+    join_none
+    #200;
+    master_read = i2c_single_read_seq::type_id::create("master_read");
+    master_read.start(p_sequencer.master_seqr);
+
+    wait fork;  // drain the ctrl legs
 
     `uvm_info(get_type_name(), "Finished i2c_stretch_vseq", UVM_LOW)
   endtask

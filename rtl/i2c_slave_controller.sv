@@ -56,8 +56,30 @@ module i2c_slave_controller
   assign sda = (sda_o == 1'b0) ? 1'b0 : 1'bz;
   // FIX: SCL is also open-drain, drive 0 for stretch, z to release
   assign scl = (scl_o == 1'b0) ? 1'b0 : 1'bz;
-  assign sda_i = sda;
-  assign scl_i = scl;
+
+  // SCL/SDA are asynchronous to clk (driven by an external master). Two-flop
+  // synchronizers guard the edge detectors and FSM against metastability.
+  // All downstream logic sees the bus with 2 cycles of latency, which is
+  // negligible against the shortest legal SCL phase.
+  logic scl_meta, scl_sync;
+  logic sda_meta, sda_sync;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      scl_meta <= 1'b1;
+      scl_sync <= 1'b1;
+      sda_meta <= 1'b1;
+      sda_sync <= 1'b1;
+    end else begin
+      scl_meta <= scl;
+      scl_sync <= scl_meta;
+      sda_meta <= sda;
+      sda_sync <= sda_meta;
+    end
+  end
+
+  assign sda_i = sda_sync;
+  assign scl_i = scl_sync;
 
   // FSM States
   typedef enum logic [3:0] {
@@ -69,8 +91,7 @@ module i2c_slave_controller
     SLV_RX_ACK,
     SLV_TX,
     SLV_TX_ACK,
-    SLV_STRETCH,
-    SLV_STOP
+    SLV_STRETCH
   } slv_state_e;
 
   slv_state_e state, next_state;
@@ -94,6 +115,7 @@ module i2c_slave_controller
   logic       stretch_active;
   logic       stretch_en_d;    // FIX: edge detect to prevent infinite re-trigger
   logic       stretch_en_rise;
+  logic       stretch_pending; // armed request waiting for a transaction
 
   // Internal register bank
   logic [7:0] internal_regs [0:7];
@@ -191,7 +213,9 @@ module i2c_slave_controller
     if (!rst_n) begin
       reg_ptr <= 3'd0;
       reg_ptr_inc_done <= 1'b0;
-    end else if (state == SLV_ACK && addr_matched) begin
+    end else if (state != SLV_ACK && next_state == SLV_ACK && addr_matched) begin
+      // Reset on ENTRY to SLV_ACK only (not every cycle in the state) so a
+      // stretch-resume into SLV_ACK cannot zero the pointer mid-transaction.
       reg_ptr <= 3'd0;
     end else if (state == SLV_RX_ACK && active_int && rx_rw == 1'b0 && !reg_ptr_inc_done) begin
       reg_ptr <= reg_ptr + 1'b1;
@@ -273,6 +297,11 @@ module i2c_slave_controller
   //*******************************************************************
   // SDA Output Logic (Open-Drain) (FIXED for TX)
   //*******************************************************************
+  // I2C data-validity rule (UM10204 3.1.3): SDA may only change while SCL is
+  // LOW. In the driving states we therefore gate every sda_o update on
+  // scl_i == 0 and HOLD the current value through the SCL-high window.
+  // Non-driving states release unconditionally (the bus is already past the
+  // window where a release could forge a START/STOP).
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       sda_o <= 1'b1;
@@ -280,24 +309,38 @@ module i2c_slave_controller
       case (state)
         // ACK: drive SDA LOW during 9th clock
         SLV_ACK: begin
-          if (addr_matched) sda_o <= 1'b0; // ACK (match found)
-          else              sda_o <= 1'b1; // NACK (no match)
+          if (scl_i == 1'b0) begin
+            if (addr_matched) sda_o <= 1'b0; // ACK (match found)
+            else              sda_o <= 1'b1; // NACK (no match)
+          end
         end
 
         // RX ACK: send ACK for received byte
         SLV_RX_ACK: begin
-          if (active_int && !force_data_nack) sda_o <= 1'b0; // ACK
-          else                                 sda_o <= 1'b1; // NACK
+          if (scl_i == 1'b0) begin
+            if (active_int && !force_data_nack) sda_o <= 1'b0; // ACK
+            else                                 sda_o <= 1'b1; // NACK
+          end
         end
 
         // FIX TX: Slave drives DATA bit from tx_shift_reg in read mode
         SLV_TX: begin
-          if (active_int) begin
-            sda_o <= tx_shift_reg[7]; // MSB first from shift register
-          end else begin
-            sda_o <= 1'b1;
+          if (scl_i == 1'b0) begin
+            if (active_int) begin
+              sda_o <= tx_shift_reg[7]; // MSB first from shift register
+            end else begin
+              sda_o <= 1'b1;
+            end
           end
         end
+
+        // FIX (EP live-run): HOLD sda_o while stretching. A slave that
+        // stretches the clock during an ACK/data bit must keep SDA stable —
+        // it has only paused the clock, not released the bus. The old code
+        // let SLV_STRETCH fall into `default: sda_o <= 1` and RELEASED the
+        // ACK mid-stretch, so a monitor sampling at the SCL rising edge read
+        // a NACK and derailed. Empty statement = the flop holds its value.
+        SLV_STRETCH: /* hold sda_o */ ;
 
         default: sda_o <= 1'b1; // Release SDA (open-drain high)
       endcase
@@ -341,24 +384,32 @@ module i2c_slave_controller
   end
   assign stretch_en_rise = stretch_en && !stretch_en_d;
 
+  // FIX (post-audit): the old logic required stretch_en_rise AND active_int
+  // in the same cycle. Testbenches arm stretch_en BEFORE the transaction
+  // begins (active_int == 0), so the edge was swallowed and the slave never
+  // actually stretched. A pending latch keeps the armed request until a
+  // transaction is active, while still preventing level re-triggering.
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-      stretch_timer  <= 16'd0;
-      stretch_active <= 1'b0;
-    end else if (stretch_en_rise && !stretch_active && active_int) begin
-      // FIX: Only trigger on RISING EDGE of stretch_en, not level
-      stretch_active <= 1'b1;
-      // FIX BUG #15: Initialize timer at 1, not 0.
-      // With timer=0 and ">=", the stretch lasted stretch_cycles+1 cycles
-      // because the check at cycle N fires after N increments (0→1→...→N).
-      // Starting at 1 aligns the >= check so it fires after exactly
-      // stretch_cycles cycles: timer goes 1, 2, ..., stretch_cycles → fires.
-      stretch_timer  <= 16'd1;
-    end else if (stretch_active) begin
-      if (stretch_timer >= stretch_cycles) begin
-        stretch_active <= 1'b0;
-      end else begin
-        stretch_timer <= stretch_timer + 1'b1;
+      stretch_timer   <= 16'd0;
+      stretch_active  <= 1'b0;
+      stretch_pending <= 1'b0;
+    end else begin
+      if (stretch_en_rise) begin
+        stretch_pending <= 1'b1;  // arm on rising edge only (no re-trigger)
+      end
+
+      if (stretch_active) begin
+        if (stretch_timer >= stretch_cycles) begin
+          stretch_active <= 1'b0;
+        end else begin
+          stretch_timer <= stretch_timer + 1'b1;
+        end
+      end else if (stretch_pending && active_int) begin
+        stretch_active  <= 1'b1;
+        stretch_pending <= 1'b0;
+        // FIX BUG #15: start at 1 so >= fires after exactly stretch_cycles.
+        stretch_timer   <= 16'd1;
       end
     end
   end
@@ -371,7 +422,10 @@ module i2c_slave_controller
       state <= SLV_IDLE;
       saved_state <= SLV_IDLE;
     end else begin
-      if (stretch_active && state != SLV_STRETCH)
+      // Capture the resume point exactly on the transition INTO SLV_STRETCH.
+      // (The old `stretch_active && state != SLV_STRETCH` form could capture
+      // one cycle late and resume into an already-advanced state.)
+      if (next_state == SLV_STRETCH && state != SLV_STRETCH)
         saved_state <= state;
       state <= next_state;
     end
@@ -446,13 +500,12 @@ module i2c_slave_controller
 
       //==================================================================
       // SLV_RX_ACK: Send ACK after receiving a byte.
+      // NOTE: START/STOP are handled by the priority override at the top
+      // of this block — no per-state checks needed (the old inner branches
+      // were unreachable dead code).
       //==================================================================
       SLV_RX_ACK: begin
-        if (stop_cond) begin
-          next_state = SLV_STOP;
-        end else if (start_cond) begin
-          next_state = SLV_START; // Repeated START
-        end else if (scl_fall) begin
+        if (scl_fall) begin
           next_state = SLV_RX; // Ready for another byte
         end else begin
           next_state = SLV_RX_ACK;
@@ -474,11 +527,7 @@ module i2c_slave_controller
       // SLV_TX_ACK: Wait for ACK/NACK from the master.
       //==================================================================
       SLV_TX_ACK: begin
-        if (stop_cond) begin
-          next_state = SLV_STOP;
-        end else if (start_cond) begin
-          next_state = SLV_START; // Repeated START
-        end else if (scl_fall) begin
+        if (scl_fall) begin
           if (sda_i == 1'b0) next_state = SLV_TX;
           else                next_state = SLV_IDLE;
         end else begin
@@ -498,13 +547,6 @@ module i2c_slave_controller
         end
       end
 
-      //==================================================================
-      // SLV_STOP: STOP condition detected. Release bus.
-      //==================================================================
-      SLV_STOP: begin
-        next_state = SLV_IDLE;
-      end
-
       default: next_state = SLV_IDLE;
 
       endcase
@@ -517,7 +559,16 @@ module i2c_slave_controller
   //*******************************************************************
   // Status & Interrupts
   //*******************************************************************
-  assign rx_data_valid = (state == SLV_RX_ACK) && active_int;
+  // One-cycle strobe: internal_updated[i] pulses for exactly one clk on the
+  // cycle a byte is committed to the register bank (the old level-version
+  // stayed high for the whole multi-cycle SLV_RX_ACK state and would
+  // double-push into any external FIFO).
+  always_comb begin
+    rx_data_valid = 1'b0;
+    for (int i = 0; i < 8; i++) begin
+      if (internal_updated[i]) rx_data_valid = 1'b1;
+    end
+  end
   assign rx_data       = latched_rx_byte; // FIX: use latched byte instead of shift_reg
   assign tx_ack        = (state == SLV_TX_ACK && sda_i == 1'b0 && active_int);
   assign tx_nack       = (state == SLV_TX_ACK && sda_i == 1'b1 && active_int);

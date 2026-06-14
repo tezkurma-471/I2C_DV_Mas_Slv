@@ -17,16 +17,52 @@ class i2c_base_seq extends uvm_sequence #(i2c_seq_item);
     super.new(name);
   endfunction
 
+  // Drive a 2-segment repeated-START chain (segment A: START, no STOP;
+  // segment B: Sr + STOP, random direction). Used by the random/stress
+  // sequences so rep-start protocol framing is part of constrained-random
+  // coverage instead of only appearing in directed tests.
+  task do_rep_chain(string prefix);
+    i2c_seq_item seg_a, seg_b;
+
+    seg_a = i2c_seq_item::type_id::create({prefix, "_chainA"});
+    seg_a.default_trans_c.constraint_mode(0);
+    start_item(seg_a);
+    if (!seg_a.randomize() with {
+      addr       == 7'h50;
+      num_data inside {[1:4]};
+      start_cond == 1;
+      stop_cond  == 0;
+      rep_start  == 0;
+    }) `uvm_fatal("SEQ", "Randomization failed for rep-chain segment A")
+    finish_item(seg_a);
+
+    seg_b = i2c_seq_item::type_id::create({prefix, "_chainB"});
+    seg_b.default_trans_c.constraint_mode(0);
+    start_item(seg_b);
+    if (!seg_b.randomize() with {
+      addr       == 7'h50;
+      num_data inside {[1:4]};
+      start_cond == 0;
+      stop_cond  == 1;
+      rep_start  == 1;
+    }) `uvm_fatal("SEQ", "Randomization failed for rep-chain segment B")
+    finish_item(seg_b);
+  endtask
+
 endclass : i2c_base_seq
 
 class i2c_single_write_seq extends i2c_base_seq;
 
   `uvm_object_utils(i2c_single_write_seq)
 
-  rand logic [6:0] addr;
-  rand logic [7:0] data;
-
-  constraint default_addr_c { addr == 7'h50; }
+  // FIX (EP live-run): these MUST be non-rand fields with defaults, not
+  // `rand` + a `default_addr_c` constraint. A constraint only applies when
+  // the SEQUENCE itself is randomized; virtual sequences start this seq via
+  // .start() WITHOUT randomizing it, leaving addr=0 — which then violates the
+  // item's valid_addr_c (addr != 0) and fatals. A default-valued field works
+  // in both the directed-test path (which sets it) and the vseq path.
+  logic [6:0] addr = 7'h50;
+  logic [7:0] data = 8'hA5;
 
   function new(string name = "i2c_single_write_seq");
     super.new(name);
@@ -53,9 +89,9 @@ class i2c_single_read_seq extends i2c_base_seq;
 
   `uvm_object_utils(i2c_single_read_seq)
 
-  rand logic [6:0] addr;
-
-  constraint default_addr_c { addr == 7'h50; }
+  // FIX (EP live-run): non-rand default, see i2c_single_write_seq above —
+  // a rand field + constraint is not applied when started via a vseq.
+  logic [6:0] addr = 7'h50;
 
   function new(string name = "i2c_single_read_seq");
     super.new(name);
@@ -196,6 +232,12 @@ class i2c_rep_start_seq extends i2c_base_seq;
     i2c_seq_item wr_item, rd_item;
 
     wr_item = i2c_seq_item::type_id::create("wr_item");
+    // FIX (EP live-run): default_trans_c pins start=1/stop=1/rep=0. The first
+    // segment needs stop_cond=0 and the second needs start_cond=0/rep_start=1,
+    // both of which CONFLICT with default_trans_c — so it must be disabled
+    // per item (exactly as deep_rep_start_sequence already does). Without
+    // this the randomize() is unsatisfiable and fatals.
+    wr_item.default_trans_c.constraint_mode(0);
     start_item(wr_item);
     if (!wr_item.randomize() with {
       addr       == local::addr;
@@ -209,6 +251,7 @@ class i2c_rep_start_seq extends i2c_base_seq;
     finish_item(wr_item);
 
     rd_item = i2c_seq_item::type_id::create("rd_item");
+    rd_item.default_trans_c.constraint_mode(0);
     start_item(rd_item);
     if (!rd_item.randomize() with {
       addr       == local::addr;
@@ -255,12 +298,13 @@ class i2c_clock_stretch_seq extends i2c_base_seq;
 
   `uvm_object_utils(i2c_clock_stretch_seq)
 
+  // NOTE: the stretch duration is owned by the SLAVE-side control sequence
+  // (i2c_slave_stretch_ctrl_seq). The old `stretch_cycles` field here was
+  // randomized and silently ignored — removed.
   rand logic [6:0]  addr;
   rand logic [7:0]  data;
-  rand logic [15:0] stretch_cycles;
 
   constraint default_addr_c  { addr == 7'h50; }
-  constraint stretch_cycles_c { stretch_cycles inside {[16'd50 : 16'd200]}; }
 
   function new(string name = "i2c_clock_stretch_seq");
     super.new(name);
@@ -357,13 +401,20 @@ class i2c_random_seq extends i2c_base_seq;
 
   task body();
     for (int i = 0; i < num_txns; i++) begin
-      i2c_seq_item item = i2c_seq_item::type_id::create($sformatf("rand_item_%0d", i));
-      start_item(item);
-      if (!item.randomize()) begin
-        `uvm_error("SEQ", $sformatf("Randomization failed for item %0d", i))
-        continue;
+      // FIX: default_trans_c pins start=1/stop=1/rep=0, so plain randomize()
+      // could never produce a repeated START. ~25% of iterations now drive a
+      // 2-segment Sr chain instead.
+      if ($urandom_range(0, 3) == 0) begin
+        do_rep_chain($sformatf("rand_%0d", i));
+      end else begin
+        i2c_seq_item item = i2c_seq_item::type_id::create($sformatf("rand_item_%0d", i));
+        start_item(item);
+        if (!item.randomize()) begin
+          `uvm_error("SEQ", $sformatf("Randomization failed for item %0d", i))
+          continue;
+        end
+        finish_item(item);
       end
-      finish_item(item);
     end
   endtask
 
@@ -381,13 +432,18 @@ class i2c_stress_seq extends i2c_base_seq;
 
   task body();
     for (int i = 0; i < num_txns; i++) begin
-      i2c_seq_item item = i2c_seq_item::type_id::create($sformatf("stress_item_%0d", i));
-      start_item(item);
-      if (!item.randomize()) begin
-        `uvm_error("SEQ", $sformatf("Randomization failed for stress item %0d", i))
-        continue;
+      // FIX: include repeated-START chains in the stress profile (~25%).
+      if ($urandom_range(0, 3) == 0) begin
+        do_rep_chain($sformatf("stress_%0d", i));
+      end else begin
+        i2c_seq_item item = i2c_seq_item::type_id::create($sformatf("stress_item_%0d", i));
+        start_item(item);
+        if (!item.randomize()) begin
+          `uvm_error("SEQ", $sformatf("Randomization failed for stress item %0d", i))
+          continue;
+        end
+        finish_item(item);
       end
-      finish_item(item);
     end
   endtask
 
@@ -485,6 +541,11 @@ class i2c_slave_force_nack_seq extends uvm_sequence #(i2c_slave_ctrl_item);
     i2c_slave_ctrl_item ctrl = i2c_slave_ctrl_item::type_id::create("ctrl");
     start_item(ctrl);
     ctrl.force_nack_off_c.constraint_mode(0);
+    // FIX (EP live-run): the item's stretch_cycles_c forces stretch_cycles
+    // into [1:500]; the inline stretch_cycles==0 below CONFLICTS with it and
+    // fatals. stretch_cycles is don't-care here (stretch_en==0), so disable
+    // that constraint and pin it to 0 for cleanliness.
+    ctrl.stretch_cycles_c.constraint_mode(0);
     if (!ctrl.randomize() with {
       stretch_en      == 1'b0;
       stretch_cycles  == 16'd0;
@@ -501,8 +562,10 @@ class i2c_slave_stretch_ctrl_seq extends uvm_sequence #(i2c_slave_ctrl_item);
 
   rand logic [15:0] stretch_cycles;
 
+  // Range must comfortably exceed the monitor's 64-cycle stretch-detection
+  // threshold and stay far below MAX_CLK_STRETCH (1000).
   constraint stretch_cycles_c {
-    stretch_cycles inside {[16'd50 : 16'd200]};
+    stretch_cycles inside {[16'd200 : 16'd400]};
   }
 
   function new(string name = "i2c_slave_stretch_ctrl_seq");

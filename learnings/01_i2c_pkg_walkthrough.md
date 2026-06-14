@@ -1,3 +1,9 @@
+> **⚠️ 2026-06-10 AUDIT UPDATE — read this box before trusting the lesson below.**
+> A deep audit + fix pass changed the code this walkthrough describes. Deltas for this file:
+> - `i2c_irq_e` was REDEFINED: values are now real bit positions in REG_IRQ_EN (IRQ_DONE=0 … IRQ_ARB_LOST=5). The old members (IRQ_TX_EMPTY, IRQ_RX_FULL) described hardware that never existed.
+> - `REG_IRQ_ST` comment fixed: it mirrors STATUS and is NOT clear-on-read (the register bus has no read strobe).
+> Full detail: [`19_audit_fixes_walkthrough.md`](./19_audit_fixes_walkthrough.md) and `docs/AUDIT_FIX_REPORT.md`.
+
 # Lesson 01 — `i2c_pkg.sv` Deep Dive
 
 **File under study:** `rtl/i2c_pkg.sv` (133 lines)
